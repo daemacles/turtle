@@ -6,11 +6,11 @@ A learning project about embedding **Lua** in **Rust** with [mlua](https://crate
 
 | Phase | Description                                                          | Status                                                        |
 | ----- | -------------------------------------------------------------------- | ------------------------------------------------------------- |
-| 0     | Rust app runs inline Lua code that prints `hello, world`             | ✅ done (2026-11-13) — awaiting user validation               |
-| 1     | Load and execute a hardcoded `main.lua` file next to the project     | planned — starts after Phase 0 is validated                    |
+| 0     | Rust app runs inline Lua code that prints `hello, world`             | ✅ done (2026-11-14) — validated by smoke test                |
+| 1     | Load and execute a hardcoded `main.lua` file next to the project     | ✅ done (2026-11-14) — validated by smoke test                |
 | 2–N   | TBD — user defines these once Phase 1 is done                        | —                                                              |
 
-## Running (current phase: Phase 0)
+## Running (current phase: Phase 1)
 
 Requires only the Rust toolchain (`cargo`). No system Lua installation is needed — Lua 5.4 is compiled statically into the binary via mlua's `vendored` feature.
 
@@ -19,10 +19,11 @@ cd turtle
 cargo run
 ```
 
-Expected output, exactly one line:
+Expected output, exactly two lines:
 
 ```
-hello, world
+main.lua loaded and executed successfully
+Phase 1 validated
 ```
 
 ## Tracking state
