@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "diagnostics.neededFileStatus": {
+    "missing-global-doc": "Any!",
+    "missing-local-export-doc": "Any!",
+    "incomplete-signature-doc": "Any!",
+    "undefined-doc-param": "Any!",
+    "duplicate-doc-param": "Any!"
+  },
+  "diagnostics.severity": {
+    "missing-global-doc": "Warning!",
+    "missing-local-export-doc": "Warning!",
+    "incomplete-signature-doc": "Warning!",
+    "undefined-doc-param": "Warning!",
+    "duplicate-doc-param": "Warning!"
+  }
+}

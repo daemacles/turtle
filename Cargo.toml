@@ -6,3 +6,38 @@ edition = "2024"
 [dependencies]
 # vendored: compile & statically link Lua 5.4, so turtle runs without a system liblua install.
 mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
+
+# dexiotites:begin doc lints (managed by dexiotites install.py; rerun it to update)
+# Tier 1 documentation enforcement for Rust (Cargo 1.74+ `[lints]` tables).
+#
+# Append these tables to the crate's Cargo.toml. In a workspace, rename them to
+# `[workspace.lints.rust]` / `[workspace.lints.rustdoc]` / `[workspace.lints.clippy]` in the
+# root Cargo.toml and add `[lints] workspace = true` to each member crate.
+#
+# The finish gate is
+#   cargo clippy --all-targets -- -D missing_docs
+# It fails on the documentation lints below and on nothing else that is only a warning, so
+# clippy's style and complexity lints are shown but never block the gate. (`-D warnings` would
+# make all of them failures, and a comment-only pass cannot fix those.)
+# missing_docs is "warn" here, and denied by the gate command, so normal builds keep working
+# mid-edit. The clippy lints are "deny": only clippy reads them, so builds are unaffected.
+#
+# Matches COMMENTING.md section 6 (Rust):
+#   - missing_docs: public items, including the crate root (`//!`), need docs.
+#   - missing_errors_doc / missing_panics_doc / missing_safety_doc: public functions that
+#     return Result, can panic, or are `unsafe` need `# Errors` / `# Panics` / `# Safety`.
+#   - undocumented_unsafe_blocks: every `unsafe` block needs a `// SAFETY:` comment.
+#   - broken_intra_doc_links: `[Name]` links in docs must resolve (keeps docs true).
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+
+[lints.clippy]
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+# dexiotites:end

@@ -1,0 +1,14 @@
+{
+  "source": "https://github.com/daemacles/dexiotites",
+  "commit": "83665a79618b181c2b1a5f0fd98adfdd42e471e8",
+  "skills": [
+    "annotate-code"
+  ],
+  "lint": true,
+  "files": {
+    ".agents/skills/annotate-code/SKILL.md": "b7094b1c0082a601b89b31c9c2760b708ce0f82217c3776d454435d36e6afd71",
+    ".agents/skills/annotate-code/scripts/comment_diff_check.py": "df509b1c2c7fd8a8c6972593888a0f7867faea5acdf78b007eac4df2972e10d6",
+    ".luarc.json": "8633e2f1dac7e6d7c4a5a06d2cbf09d6e693d9f6c829d8f6acca6e0d140e3f63",
+    "docs/COMMENTING.md": "909457f92cc7530f10e881bacd01741ea191f53f226a7111c09d684c4f34964e"
+  }
+}
