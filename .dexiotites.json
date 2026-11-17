@@ -1,14 +1,15 @@
 {
   "source": "https://github.com/daemacles/dexiotites",
-  "commit": "83665a79618b181c2b1a5f0fd98adfdd42e471e8",
+  "commit": "0be04015dccabcad320a89836e1ba730cf34be83",
   "skills": [
     "annotate-code"
   ],
   "lint": true,
   "files": {
-    ".agents/skills/annotate-code/SKILL.md": "b7094b1c0082a601b89b31c9c2760b708ce0f82217c3776d454435d36e6afd71",
+    ".agents/skills/annotate-code/SKILL.md": "3e8e8a7bee10d63f78070e7547f4425784c09e199c8ad74f651a14553f9e1b6c",
     ".agents/skills/annotate-code/scripts/comment_diff_check.py": "df509b1c2c7fd8a8c6972593888a0f7867faea5acdf78b007eac4df2972e10d6",
+    ".agents/skills/annotate-code/scripts/comment_load.py": "d5f18f023da408c884cc9a6034aac3e2f04fb745e8bea3c291f3ad3e0739c835",
     ".luarc.json": "8633e2f1dac7e6d7c4a5a06d2cbf09d6e693d9f6c829d8f6acca6e0d140e3f63",
-    "docs/COMMENTING.md": "909457f92cc7530f10e881bacd01741ea191f53f226a7111c09d684c4f34964e"
+    "docs/COMMENTING.md": "331bb94cec98a4642f1ee9d40449d3375a12aedb4cec98664c6dea442a0d8c9c"
   }
 }

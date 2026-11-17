@@ -78,7 +78,8 @@ type already say all of that.
 
 ## 3. Prohibited comments
 
-- **Restating the code.** `// increment counter` above `count++`.
+- **Restating the code.** `// increment counter` above `count++`. A comment that says what
+  code does is fine when it is cheaper to read than the code (section 10.6).
 - **Copying constant values into prose.** Write "within [clusterRadiusMeters]", not "within 40 mm".
   The prose copy goes stale when the constant changes, which is the most common source of
   comments that contradict the code. Link the symbol instead. Exception: citing the spec that
@@ -209,6 +210,147 @@ skill's `comment_diff_check.py` script, and report, rather than fix, any suspect
 
 ---
 
+## 10. Voice: write for a reader with a small working memory
+
+A comment exists to lower the reader's effort. A reader can hold about four unfamiliar things
+at once. Every identifier, number, file path, unexplained term and parenthetical in a sentence
+takes one of those places. When a sentence needs more, the reader starts again or gives up.
+The rules below keep each sentence inside that budget without dropping technical content: the
+content moves to where the reader needs it.
+
+### 10.1 Two layers, two places
+
+| Layer | Answers | Lives in | Survives a rewrite of the body? |
+|---|---|---|---|
+| Contract | What is this for? How do I use it correctly? | The doc comment | Yes |
+| Mechanism | How does it do it? Why this way? | Inline, beside the code | No |
+
+Test each sentence of a doc comment: *would it still be true if the body were reimplemented?*
+If not, it is mechanism. Move it inline, next to the line it describes.
+
+The contract is written in the caller's terms:
+- **Call order and lifecycle:** what must be called first, what must be called last, what is
+  safe to call twice.
+- **Threads:** which thread may call what, and what the caller must not do concurrently. Say
+  "safe to call from any thread", not that a method is `synchronized`. Say why it matters.
+- **Ownership and cleanup:** who releases what, and what stays valid for how long.
+- **Failure:** what the caller sees when it goes wrong.
+
+Never name a private member in a doc comment. If the contract cannot be stated without one,
+the sentence is mechanism.
+
+### 10.2 Sentence rules
+
+1. **Purpose first, in plain words.** The first sentence of a doc comment has no identifiers,
+   numbers or paths. A reader who stops there knows what the thing is for.
+2. **Say what a thing is before you name it.** "Scan state lives in the view model,
+   [ScannerViewModel]", not the name alone. Link a name once per comment.
+3. **At most two code names in a sentence.** If a sentence needs more, it is a list or it is
+   mechanism.
+4. **No parentheticals inside a sentence.** If the aside matters, give it its own sentence. If
+   it does not, delete it.
+5. **Numbers live at their definition.** Do not copy a constant's value, a range or a unit into
+   prose elsewhere. State it once, on the parameter or the constant.
+   Exception: anything visible outside the code is contract and stays in the doc comment. That
+   covers file names, folder layout on disk, wire and file formats, and the shape of the data a
+   caller passes in or gets back.
+6. **Do not restate the signature.** Modifiers, types and default values are already visible.
+7. **Explain a project term once per file,** in the file header or the first comment that uses
+   it. Expand an acronym the first time.
+
+### 10.3 Do not make the reader jump
+
+- The purpose of a thing must be readable where the thing is. A pointer to another file or
+  another comment is for detail only, and says in a few words what is there.
+- Define each fact in one place. Other places give the gist in a clause and point to it. This
+  is the balance between repeating yourself and sending the reader away: repeat the gist, not
+  the detail.
+- The file header and the type comment do different jobs and do not repeat each other. The
+  header (section 2) says how the file fits into the system: what feeds it, what consumes it,
+  and the design. The type comment says what the type is for and how to use it.
+- Before a call whose effect the reader needs, say in a few words what the call does, so the
+  reader does not have to open the callee to follow the caller.
+
+### 10.4 Show how to use it
+
+A type with a required call sequence shows it in its doc comment: a usage example of at most
+ten lines, or a small lifecycle sketch. Use only the public API in it. Where the language
+compiles examples without a code change (Rust doc tests), use that so the example cannot rot.
+Elsewhere an uncompiled sketch is allowed, for these types only: every uncompiled example is a
+second place to update, so a type with no required order gets none.
+
+### 10.5 What does not belong
+
+- **Facts about one developer's setup:** machine names, people, local paths. A comment states
+  what the code requires, not where it happened to be built.
+- **Requirement citations in a summary.** When a line of code exists because a project
+  requirement says so, cite the requirement inline beside that line. The doc comment states
+  the behaviour, not the paperwork.
+- **References to this guide.** Comments follow it; they do not cite it.
+
+### 10.6 Kinds of comment, and where each goes
+
+The kinds are antirez's (reference 18). Each has one job. A comment that tries to do two is
+usually in the wrong place.
+
+| Kind | Job | Place |
+|---|---|---|
+| Function | Lets the reader treat a type or function as a black box that obeys stated rules, without reading its body. | Doc comment |
+| Design | How the file's parts fit together and why this design, including the alternative that was rejected when the chosen one looks too simple. | File header |
+| Why | The reason for a line whose effect is clear but whose purpose is not. It also tells the next editor what must be preserved. | Inline, at the line |
+| Teacher | The domain the code works in: the math, the protocol, the data structure. | Above the function that needs it, or the file header if the whole file does. For a long algorithm, number the steps in the explanation and repeat the numbers at the code. |
+| Checklist | "If you change this, also change that", or "this must happen after that". | Inline, at the place that must change |
+| Guide | Divides a long function into steps and says what each step does, so the reader keeps their place. | Inline |
+
+A guide comment may say *what* the code does. That is allowed when it saves effort: annotating
+each line of a stack-machine sequence with the stack's contents is a good comment. The test is
+cost. If reading the comment takes as much effort as reading the code it sits on, it is a
+trivial comment: delete it. This test replaces a blanket rule against restating the code.
+
+Unfinished work does not go in a TODO at the line. Put it in the file's design comment: what is
+not done, why it is acceptable for now, and where the change would go. Never keep old code in
+a comment; version control holds it.
+
+### 10.7 Before and after
+
+Before:
+
+```kotlin
+/**
+ * Single-activity entry point for the GneissFind geological tricorder.
+ *
+ * Responsibilities:
+ * - Enforces [ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE] and registers a [DisplayManager.DisplayListener]
+ *   so 180-degree flips between [Surface.ROTATION_90] and [Surface.ROTATION_270] update [ScannerViewModel]
+ *   even when Android suppresses Activity recreation.
+ */
+```
+
+After:
+
+```kotlin
+/**
+ * Single-activity entry point for the GneissFind geological tricorder.
+ *
+ * Responsibilities:
+ * - Enforces landscape mode and keeps the display oriented correctly whether the phone is
+ *   held rotated left or right, even when Android suppresses Activity recreation.
+ */
+```
+
+The listener, the two rotation constants and the reason Android skips recreation move inline,
+beside the code that registers the listener.
+
+Before: "`startSession` and `stopSession` are `@Synchronized`." After: "Sessions may be
+started and stopped from any thread. Frames offered while the writer is busy are dropped, not
+queued, so the camera thread never waits on disk."
+
+### 10.8 Checking the voice
+
+`annotate-code` ships `comment_load.py`, which counts the sentence rules above per doc comment
+and prints a score. It judges form only, so its report is advisory. Whether the purpose is
+plain and the caller's contract complete is judged by reading, with that report as input.
+
 ## Exemplar codebases (for the human reader)
 
 These are well known for comments that teach the reader. They are worth browsing for calibration.
@@ -262,3 +404,10 @@ These are well known for comments that teach the reader. They are worth browsing
 16. Ruff, pydocstyle rules and the `convention` setting. https://docs.astral.sh/ruff/rules/#pydocstyle-d
 17. LuaLS, "Diagnostics" (`missing-global-doc`, `missing-local-export-doc`,
     `incomplete-signature-doc`). https://luals.github.io/wiki/diagnostics/
+18. antirez (Salvatore Sanfilippo), "Writing system software: code comments" (the kinds of
+    comment in section 10.6, and comments as a way to lower the reader's load).
+    https://antirez.com/news/124
+19. Cowan, N., "The magical number 4 in short-term memory", Behavioral and Brain Sciences 24
+    (2001); Chandler, P. and Sweller, J., "The split-attention effect as a factor in the design
+    of instruction", British Journal of Educational Psychology 62 (1992) (the working-memory
+    budget and the no-jump rule in section 10).
