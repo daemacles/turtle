@@ -117,12 +117,12 @@ sync-skills-repo skill regenerates that file from this block, so edit the script
 #!/usr/bin/env python3
 """Verify that a source change touched only comments.
 
-Compares each changed source file against a git revision after stripping comments
-(and, for Python, module/class/function/attribute docstrings) from both versions
-and tokenizing code so whitespace and line-wrapping around comments do not count
-as differences. String and character literals are preserved verbatim (with comments
-stripped inside Kotlin `${...}` template expressions). Any remaining difference
-means code changed.
+Each changed source file is compared with its version at a git revision. Comments are
+stripped from both versions first; for Python that includes docstrings. The code that is
+left is tokenized, so whitespace and line wrapping around comments do not count as
+differences. String and character literals are kept verbatim, except that comments inside
+a Kotlin `${...}` template expression are stripped. Any remaining difference means code
+changed.
 
 Line breaks are ignored except where the language gives them meaning: in Kotlin, a
 line break outside `(...)` and `[...]` can end a statement, so it is kept as a token
@@ -133,11 +133,12 @@ Usage:
     python3 comment_diff_check.py --base main             # compare against another revision
     python3 comment_diff_check.py --strict path/to/A.kt   # fail on NEW or SKIP files too
 
-Exit status: 0 if every checked file is comment-only (and none were NEW/SKIP under
---strict), 1 if code changed (or NEW/SKIP under --strict), 2 on usage or git errors.
+Exit status: 0 if every checked file is comment-only, 1 if code changed, 2 on usage or
+git errors. Under --strict a NEW or SKIP file also gives 1.
 
-Supported: Kotlin (.kt, .kts), Rust (.rs), Python (.py), Lua (.lua). Other files
-report SKIP. New (untracked or added) files have no base version and report NEW.
+Supported file types: .kt and .kts for Kotlin, .rs for Rust, .py for Python, .lua for Lua.
+Other files report SKIP. A file that is untracked or newly added has no base version and
+reports NEW.
 Requires Python 3.9 or newer.
 """
 
@@ -195,9 +196,10 @@ def strip_c_like(src: str, rust: bool) -> list[str]:
 def _scan_c_like(src: str, i: int, rust: bool, stop_on_rbrace: bool) -> tuple[list[str], int]:
     """Scan Kotlin/Rust code from index `i`, optionally stopping at a matching `}`.
 
-    For Kotlin, tracks open `(`, `[` and `{` so a line break emits an `NL` token only
-    where Kotlin treats it as a possible statement end: at top level or directly inside
-    `{...}` (class, function and lambda bodies), but not inside `(...)` or `[...]`.
+    For Kotlin, open brackets are tracked so that a line break emits an `NL` token only
+    where Kotlin treats it as a possible statement end. That is at top level and directly
+    inside braces, which covers class, function and lambda bodies. It is not inside
+    parentheses or square brackets.
     """
     tokens: list[str] = []
     buf: list[str] = []
@@ -382,12 +384,15 @@ def _rust_raw_end(src: str, i: int) -> int:
 def strip_lua(src: str) -> list[str]:
     r"""Return the code of a Lua file as tokens with comments removed.
 
-    Follows the Lua 5.1-5.4 lexical rules: `--` line comments; `--[[...]]` and
-    `--[==[...]==]` long comments, which do not nest; single- or double-quoted strings
-    with backslash escapes (including `\z`, which skips the following whitespace); and
-    `[[...]]` / `[==[...]==]` long strings. Strings are kept verbatim as single tokens.
-    `//` is floor division (Lua 5.3+), never a comment. Line breaks carry no meaning in
-    Lua, so line wrapping does not count as a change.
+    Follows the Lua 5.1 to 5.4 lexical rules:
+    - `--` starts a line comment.
+    - `--[[...]]` and `--[==[...]==]` are long comments, which do not nest.
+    - Quoted strings use single or double quotes and backslash escapes. The `\z` escape
+      skips the whitespace that follows it.
+    - `[[...]]` and `[==[...]==]` are long strings.
+
+    Strings are kept verbatim as single tokens. `//` is floor division, never a comment.
+    Line breaks carry no meaning in Lua, so line wrapping does not count as a change.
 
     Args:
         src: Full source text of the file.
@@ -470,10 +475,9 @@ def _is_str_expr(stmt: ast.stmt) -> bool:
 def strip_python(src: str) -> list[str]:
     """Return canonical indented AST lines with docstrings removed.
 
-    Strips module, class, and function docstrings (`body[0]`), plus PEP 257 /
-    dataclass attribute docstrings (a bare string literal immediately following an
-    assignment or annotated assignment in a module or class body). Comments never
-    enter the AST.
+    Module, class and function docstrings are stripped. So are attribute docstrings: a
+    bare string literal directly after an assignment in a module or class body, as PEP 257
+    and dataclasses use them. Comments never enter the AST.
     """
     tree = ast.parse(src)
     for node in ast.walk(tree):
@@ -497,7 +501,13 @@ def strip_python(src: str) -> list[str]:
 
 
 def code_only(path: str, src: str) -> tuple[str, list[str]] | None:
-    """Return `('tokens' | 'ast', items)` for supported files, or `None` if unsupported."""
+    """Reduce a file to its code, in the form suited to its language.
+
+    Returns:
+        A pair of kind and items, or None for an unsupported file type. The kind is
+        `tokens` for Kotlin, Rust and Lua and `ast` for Python; two versions of a file hold
+        the same code exactly when their items are equal.
+    """
     ext = Path(path).suffix
     if ext in C_LIKE:
         return ("tokens", strip_c_like(src, rust=(ext == ".rs")))
@@ -610,7 +620,7 @@ This block must stay identical to `scripts/comment_load.py`; edit the script her
 #!/usr/bin/env python3
 r"""Report how hard a file's doc comments are to read, by the sentence rules of COMMENTING.md.
 
-The commenting guide's section 10 ("Voice") limits what one sentence of a doc comment may ask
+The commenting guide's section 10, "Voice", limits what one sentence of a doc comment may ask
 a reader to hold in mind. This script counts the things that section names and prints one
 warning per sentence that breaks a rule, then a score per file. It judges form only. It cannot
 tell whether a comment is true, whether the purpose is stated, or whether the caller's contract
@@ -630,8 +640,9 @@ Warnings (the number in brackets is the rule in section 10):
     W5 [10.3]    points to another file or to a numbered section
     W6 [10.1]    names a private member (Kotlin `private`, Python leading underscore)
 
-The score is warnings per 100 sentences. The report is advisory: a warning can be right to
-leave in place (W4 on a file name or data format, which the guide keeps in doc comments).
+The score is warnings per 100 sentences. The report is advisory, because a warning can be
+right to leave in place. The guide keeps file names and data formats in doc comments, and
+those earn W4 or W5.
 Exit code is 0, or 1 when `--fail-over` is given and any file's score exceeds it.
 Requires Python 3.9 or newer.
 """
@@ -666,7 +677,7 @@ CHECKS = {
 
 
 def prose_lines(raw: str) -> list[tuple[int, str]]:
-    """Return a doc comment's prose as (line offset, text) pairs.
+    """Return a doc comment's prose, one pair of line offset and text per line.
 
     Comment markers are stripped. Tag lines, the indented lines of a tagged section, and
     fenced or indented code examples are left out: the sentence rules apply to prose only.

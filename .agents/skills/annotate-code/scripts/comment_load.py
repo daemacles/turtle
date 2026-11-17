@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""Report how hard a file's doc comments are to read, by the sentence rules of COMMENTING.md.
 
-The commenting guide's section 10 ("Voice") limits what one sentence of a doc comment may ask
+The commenting guide's section 10, "Voice", limits what one sentence of a doc comment may ask
 a reader to hold in mind. This script counts the things that section names and prints one
 warning per sentence that breaks a rule, then a score per file. It judges form only. It cannot
 tell whether a comment is true, whether the purpose is stated, or whether the caller's contract
@@ -21,8 +21,9 @@ Warnings (the number in brackets is the rule in section 10):
     W5 [10.3]    points to another file or to a numbered section
     W6 [10.1]    names a private member (Kotlin `private`, Python leading underscore)
 
-The score is warnings per 100 sentences. The report is advisory: a warning can be right to
-leave in place (W4 on a file name or data format, which the guide keeps in doc comments).
+The score is warnings per 100 sentences. The report is advisory, because a warning can be
+right to leave in place. The guide keeps file names and data formats in doc comments, and
+those earn W4 or W5.
 Exit code is 0, or 1 when `--fail-over` is given and any file's score exceeds it.
 Requires Python 3.9 or newer.
 """
@@ -57,7 +58,7 @@ CHECKS = {
 
 
 def prose_lines(raw: str) -> list[tuple[int, str]]:
-    """Return a doc comment's prose as (line offset, text) pairs.
+    """Return a doc comment's prose, one pair of line offset and text per line.
 
     Comment markers are stripped. Tag lines, the indented lines of a tagged section, and
     fenced or indented code examples are left out: the sentence rules apply to prose only.
