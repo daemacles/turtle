@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 # vendored: compile & statically link Lua 5.4, so turtle runs without a system liblua install.
 mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
+# terminal_graphics: render colored text in the terminal.
+terminal_graphics = "1.1"
 
 # dexiotites:begin doc lints (managed by dexiotites install.py; rerun it to update)
 # Tier 1 documentation enforcement for Rust (Cargo 1.74+ `[lints]` tables).
