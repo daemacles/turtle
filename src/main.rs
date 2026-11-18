@@ -1,619 +1,683 @@
-//! Interactive terminal loop for evaluating user-entered Lua code.
+//! Interactive terminal game and simulation engine driven by hot-reloaded Lua world scripts.
 //!
-//! Reads commands and script lines from standard input, runs Lua chunks in an embedded virtual
-//! machine, and paints colored frames to standard output through [Display]. Global Lua state
-//! persists across turns, and calls to Lua's print function route into the rendered output frames
-//! rather than bypassing the character grid.
-//!
-//! Input handling reads one line per prompt turn on the main thread, distinguishing built-in
-//! control commands from Lua source before compilation.
+//! Launches a fixed-size character-grid viewport around an embedded Lua world controller, polls
+//! raw keyboard input without blocking timed updates, manages authoritative entity storage, and
+//! atomically reloads modified scripts back to time zero without losing terminal stability on
+//! mid-edit syntax errors.
 
-use std::cell::RefCell;
-use std::io::{self, IsTerminal, Write};
-use std::rc::Rc;
+mod lua_host;
+mod model;
+mod render;
+mod tty;
+
+use std::collections::HashMap;
+use std::io::{self, ErrorKind};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mlua::prelude::*;
-use terminal_graphics::shapes::Rect;
-use terminal_graphics::{Colour, Container, Display, Graphic, Text};
+use terminal_graphics::{Colour, Display};
 
-/// Horizontal cell width shared by framed panels and wrapped output frames.
-const PANEL_WIDTH: u32 = 72;
+use crate::lua_host::{FileStampWatcher, LuaWorld};
+use crate::model::{
+    Action, Camera, CellWidth, EntityStore, Intent, MessageLog, Pacing, RepeatCadence, TileStyle, VIEWPORT_ROWS,
+};
+use crate::render::{FRAME_HEIGHT, FRAME_WIDTH, FrameState};
+use crate::tty::{RawInput, TerminalGuard};
 
-/// Literal prompt string painted before each user input read.
-const PROMPT_TEXT: &str = "turtle> ";
+/// Duration that the outer border stays highlighted green after a successful hot-reload.
+const RELOAD_FLASH_DURATION: Duration = Duration::from_millis(300);
 
-/// Four-space replacement expanded for each horizontal tab before drawing into a cell grid.
-const TAB_SPACES: &str = "    ";
+/// Maximum poll wait in milliseconds so file-modification checks run promptly while idle.
+const WATCH_POLL_CAP_MS: i32 = 150;
 
-/// Shared per-turn sink collecting formatted lines emitted by Lua's print function.
-type OutputBuffer = Rc<RefCell<Vec<String>>>;
-
-/// Parsed action produced from one trimmed line of user input.
-///
-/// Lifetime `'a` borrows directly from the raw line buffer when input is routed to Lua evaluation,
-/// avoiding extra allocation on the common script path.
-enum ReplCommand<'a> {
-    /// Empty or whitespace-only line that re-prompts without evaluating Lua.
-    Blank,
-    /// Built-in command requesting the summary panel.
-    Help,
-    /// Built-in command requesting loop termination.
-    Quit,
-    /// Raw user text forwarded to the Lua evaluator.
-    Eval(&'a str),
+/// Parsed command-line options controlling which world script runs and optional headless steps.
+struct CliOptions {
+    /// Path to the Lua world script loaded at startup and watched for edits.
+    script_path: PathBuf,
+    /// Optional bounded step count for non-interactive smoke runs.
+    max_steps: Option<u64>,
 }
 
-/// Multi-line block of individually colored strings positioned relative to an origin cell.
-///
-/// Implements [Graphic] so [Container] can lay out several consecutive rows inside one bordered
-/// panel. Owns its line buffer and stores its top-left origin in display cells, with horizontal
-/// coordinates growing rightward and vertical coordinates growing downward. Constructed directly by
-/// panel helpers and rendered sequentially on the main thread.
-struct TextBlock {
-    /// Horizontal origin column in display cells.
-    pos_x: isize,
-    /// Vertical origin row in display cells.
-    pos_y: isize,
-    /// Ordered text rows paired with their foreground color.
-    lines: Vec<(String, Colour)>,
+/// Complete mutable runtime state owned by the simulation loop.
+struct EngineState {
+    /// Path to the Lua world script being executed and watched.
+    script_path: PathBuf,
+    /// Active validated Lua world instance, or nothing when initial startup failed interactively.
+    world: Option<LuaWorld>,
+    /// Most recent script-declared seed observed, used to detect deliberate seed edits on reload.
+    last_declared_seed: Option<u64>,
+    /// Metadata watcher detecting editor saves to the world script.
+    watcher: FileStampWatcher,
+    /// Authoritative entity store shared across simulation steps and rendering.
+    store: EntityStore,
+    /// Viewport camera following the player deadzone or manual panning.
+    camera: Camera,
+    /// Key-repeat throttle protecting exploration movement from terminal repeat floods.
+    cadence: RepeatCadence,
+    /// Bounded queue of recent event and print messages shown below the viewport.
+    log: MessageLog,
+    /// Optional status summary string returned by the active world script.
+    hud_status: String,
+    /// Current random seed passed to world initialization.
+    seed: u64,
+    /// Current simulation step counter starting at zero after initialization or reset.
+    tick: u64,
+    /// Whether timed or hybrid automatic stepping is currently paused.
+    paused: bool,
+    /// Timestamp until which the reload confirmation highlight stays active.
+    reload_flash_until: Option<Instant>,
+    /// Next scheduled monotonic deadline for tick or hybrid idle stepping.
+    next_step_at: Option<Instant>,
+    /// Latest player intent queued in tick mode until the next clock beat fires.
+    pending_tick_intent: Option<Intent>,
+    /// Latest terrain rows returned by the active world script for the current camera bounds.
+    terrain: Vec<Vec<TileStyle>>,
+    /// Non-fatal script error shown inside an overlay while keeping the last valid state frozen.
+    error_overlay: Option<String>,
+    /// Last terminal dimensions seen when smaller than the required canvas, for redraw detection.
+    last_too_small: Option<(u16, u16)>,
+    /// Flag indicating that the frame buffer needs to be re-composed and printed.
+    dirty: bool,
 }
 
-impl Graphic for TextBlock {
-    fn draw(&self, display: &mut Display) {
-        for (row, (line, fg)) in self.lines.iter().enumerate() {
-            Text::new(
-                self.pos_x,
-                self.pos_y.saturating_add(row as isize),
-                line,
-                *fg,
-                Colour::Black,
-            )
-            .draw(display);
+impl EngineState {
+    /// Creates an initial unpopulated engine state ready to load a world script.
+    fn new(script_path: PathBuf) -> Self {
+        let watcher = FileStampWatcher::new(&script_path);
+        Self {
+            script_path,
+            world: None,
+            last_declared_seed: None,
+            watcher,
+            store: EntityStore::default(),
+            camera: Camera::default(),
+            cadence: RepeatCadence::new(),
+            log: MessageLog::default(),
+            hud_status: String::new(),
+            seed: roll_random_seed(),
+            tick: 0,
+            paused: false,
+            reload_flash_until: None,
+            next_step_at: None,
+            pending_tick_intent: None,
+            terrain: default_blank_terrain(CellWidth::Two),
+            error_overlay: None,
+            last_too_small: None,
+            dirty: true,
         }
     }
 
-    fn position(&self) -> (isize, isize) {
-        (self.pos_x, self.pos_y)
-    }
+    /// Compiles and initializes the script in an isolated candidate virtual machine before swapping.
+    ///
+    /// Preserves the previous world, entities, and terrain intact if compilation, initialization, or
+    /// the initial viewport query fails, recording the diagnostic in `error_overlay`.
+    fn reload_from_disk(
+        &mut self,
+        now: Instant,
+        fresh_seed: bool,
+        announce_reload: bool,
+    ) -> LuaResult<()> {
+        let candidate = LuaWorld::load_from_path(&self.script_path)?;
+        let declared = candidate.config().declared_seed;
 
-    fn set_position(&mut self, pos_x: isize, pos_y: isize) {
-        self.pos_x = pos_x;
-        self.pos_y = pos_y;
-    }
-}
-
-/// Classifies one line of standard input into a control command or Lua source.
-///
-/// Leading and trailing whitespace are ignored when matching built-in command names. Any other
-/// non-blank text keeps its original borrowed slice as [ReplCommand::Eval].
-///
-/// - `input`: raw single line entered by the user without a trailing newline.
-fn parse_command(input: &str) -> ReplCommand<'_> {
-    match input.trim() {
-        "" => ReplCommand::Blank,
-        "help" => ReplCommand::Help,
-        "quit" => ReplCommand::Quit,
-        _ => ReplCommand::Eval(input),
-    }
-}
-
-/// Splits text into wrapped lines free of carriage returns and horizontal tabs.
-///
-/// Strips carriage returns, replaces each tab with [TAB_SPACES], breaks on newlines, and chunks
-/// long lines by Unicode scalar count so every output row fits within `max_width` terminal cells.
-/// Empty input or empty lines between newlines each yield one empty string so blank lines remain
-/// visible.
-///
-/// - `text`: arbitrary source string to prepare for grid drawing.
-/// - `max_width`: maximum character columns per output row; values below one clamp to one column.
-fn wrap_lines(text: &str, max_width: usize) -> Vec<String> {
-    let width = max_width.max(1);
-    let normalized = text.replace('\r', "").replace('\t', TAB_SPACES);
-    let mut wrapped = Vec::new();
-
-    for raw_line in normalized.split('\n') {
-        if raw_line.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-
-        let mut current = String::new();
-        let mut count = 0;
-        for ch in raw_line.chars() {
-            if count == width {
-                wrapped.push(current);
-                current = String::new();
-                count = 0;
-            }
-            current.push(ch);
-            count += 1;
-        }
-        if !current.is_empty() {
-            wrapped.push(current);
-        }
-    }
-
-    wrapped
-}
-
-/// Reserves vertical terminal rows and writes a buffered frame to standard output.
-///
-/// Calls [Display::reserve_space] immediately before [Display::print] so the cursor-up escape
-/// sequence inside the rendered frame overwrites only freshly allocated blank lines instead of
-/// earlier terminal scrollback.
-///
-/// - `display`: off-screen character grid holding the complete frame to emit.
-///
-/// # Errors
-///
-/// Returns any standard-output error reported while reserving space or printing the frame.
-fn flush_display(display: &Display) -> io::Result<()> {
-    display.reserve_space()?;
-    display.print()
-}
-
-/// Builds an off-screen character grid holding a bordered panel of wrapped colored lines.
-///
-/// Wraps each entry to leave one cell of horizontal padding inside both vertical border edges and
-/// fills the panel interior with black.
-///
-/// - `rows`: ordered pairs of text and foreground color drawn top to bottom.
-/// - `border`: color used for the surrounding box border.
-fn build_panel_display(rows: &[(&str, Colour)], border: Colour) -> Display {
-    // Reserve 2 cells for left/right borders plus 1 cell of padding on each side.
-    let inner_width = PANEL_WIDTH.saturating_sub(4).max(1) as usize;
-    let mut wrapped_lines = Vec::new();
-    for (text, fg) in rows {
-        for line in wrap_lines(text, inner_width) {
-            wrapped_lines.push((line, *fg));
-        }
-    }
-
-    let content_rows = wrapped_lines.len().max(1);
-    let total_height = content_rows as isize + 2;
-    // Offset (1, 0) inside Container leaves one column of horizontal padding from the left border.
-    let block = TextBlock {
-        pos_x: 1,
-        pos_y: 0,
-        lines: wrapped_lines,
-    };
-    let container = Container::new(0, 0, PANEL_WIDTH as isize, total_height, border, Colour::Black)
-        .with_content(block);
-
-    let mut display = Display::new(PANEL_WIDTH, total_height as u32);
-    container.draw(&mut display);
-    display
-}
-
-/// Renders a bordered terminal panel containing colored lines of wrapped text.
-///
-/// Wraps each input entry to fit inside the container padding and writes the resulting box to
-/// standard output through [flush_display].
-///
-/// - `rows`: ordered pairs of message text and foreground color drawn top to bottom.
-/// - `border`: color used for the surrounding box border.
-///
-/// # Errors
-///
-/// Returns any standard-output error encountered while reserving space or printing the frame.
-fn render_panel(rows: &[(&str, Colour)], border: Colour) -> io::Result<()> {
-    let display = build_panel_display(rows, border);
-    flush_display(&display)
-}
-
-/// Displays the startup welcome panel describing available session commands.
-///
-/// # Errors
-///
-/// Returns any standard-output error encountered while writing the panel.
-fn render_banner() -> io::Result<()> {
-    render_panel(
-        &[
-            ("turtle — interactive Lua 5.4 REPL", Colour::BrightCyan),
-            (
-                "Type 'help' for commands, 'quit' to exit, or enter Lua code.",
-                Colour::White,
-            ),
-        ],
-        Colour::Cyan,
-    )
-}
-
-/// Displays the built-in command reference panel.
-///
-/// # Errors
-///
-/// Returns any standard-output error encountered while writing the panel.
-fn render_help() -> io::Result<()> {
-    render_panel(
-        &[
-            ("Available commands:", Colour::BrightYellow),
-            ("  help  - show this command summary", Colour::White),
-            ("  quit  - exit the REPL", Colour::White),
-            (
-                "  <lua> - evaluate a Lua expression or statement",
-                Colour::White,
-            ),
-        ],
-        Colour::Yellow,
-    )
-}
-
-/// Displays the input prompt and optionally positions the cursor inline for interactive typing.
-///
-/// Flushes [PROMPT_TEXT] in green to standard output. When `inline_cursor` is true, moves the
-/// terminal cursor back onto the prompt row just after the trailing space so user input appears on
-/// the same line.
-///
-/// - `inline_cursor`: whether standard input and output are terminals supporting inline editing.
-///
-/// # Errors
-///
-/// Returns any standard-output error encountered while writing or positioning the prompt.
-fn render_prompt(inline_cursor: bool) -> io::Result<()> {
-    let prompt_width = PROMPT_TEXT.chars().count();
-    let mut display = Display::new(prompt_width as u32, 1);
-    Text::new(0, 0, PROMPT_TEXT, Colour::BrightGreen, Colour::Black).draw(&mut display);
-    flush_display(&display)?;
-
-    if inline_cursor {
-        // Display::print() ends one row below the grid; move back up and past the prompt text.
-        let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[1F\x1b[{prompt_width}C")?;
-        stdout.flush()?;
-    }
-
-    Ok(())
-}
-
-/// Builds an off-screen character grid containing wrapped lines painted over a black background.
-///
-/// Returns `None` when `lines` is empty.
-///
-/// - `lines`: raw output lines whose embedded tabs, carriage returns, and newlines are normalized.
-/// - `fg`: foreground color applied to every rendered character.
-fn build_lines_display(lines: &[String], fg: Colour) -> Option<Display> {
-    if lines.is_empty() {
-        return None;
-    }
-
-    let mut wrapped = Vec::new();
-    for line in lines {
-        wrapped.extend(wrap_lines(line, PANEL_WIDTH as usize));
-    }
-
-    let height = wrapped.len() as u32;
-    let mut display = Display::new(PANEL_WIDTH, height);
-    // Display::new() fills cells with a white background; paint black first so unused cells match.
-    Rect::new(0, 0, PANEL_WIDTH as isize, height as isize, Colour::Black).draw(&mut display);
-    for (row, text) in wrapped.iter().enumerate() {
-        Text::new(0, row as isize, text, fg, Colour::Black).draw(&mut display);
-    }
-
-    Some(display)
-}
-
-/// Renders zero or more lines on a black background with a uniform foreground color.
-///
-/// Does nothing and returns immediately when `lines` is empty. Otherwise wraps every line to
-/// [PANEL_WIDTH], fills the grid background with black, and flushes the frame to standard output.
-///
-/// - `lines`: raw output lines whose embedded tabs, carriage returns, and newlines are normalized.
-/// - `fg`: foreground color applied to every rendered character.
-///
-/// # Errors
-///
-/// Returns any standard-output error encountered while writing the frame.
-fn render_lines(lines: &[String], fg: Colour) -> io::Result<()> {
-    if let Some(display) = build_lines_display(lines, fg) {
-        flush_display(&display)?;
-    }
-    Ok(())
-}
-
-/// Renders Lua print output and expression results in bright white text.
-///
-/// Does nothing when `lines` is empty.
-///
-/// - `lines`: formatted lines collected from Lua evaluation.
-///
-/// # Errors
-///
-/// Returns any standard-output error encountered while writing the frame.
-fn render_output(lines: &[String]) -> io::Result<()> {
-    render_lines(lines, Colour::BrightWhite)
-}
-
-/// Formats and renders a Lua compilation or runtime error in bright red text.
-///
-/// - `err`: error returned by compiling or running the user's Lua chunk.
-///
-/// # Errors
-///
-/// Returns any standard-output error encountered while writing the error frame.
-fn render_error(err: &LuaError) -> io::Result<()> {
-    let message = format!("Error: {err}");
-    render_lines(&[message], Colour::BrightRed)
-}
-
-/// Converts any Lua value to a printable string using Lua's global conversion helper.
-///
-/// Invokes the global `tostring` function inside `lua` so primitives, tables, and custom
-/// metamethods format identically to standard Lua output.
-///
-/// - `lua`: active Lua virtual machine providing the global `tostring` function.
-/// - `value`: Lua value to convert into human-readable text.
-///
-/// # Errors
-///
-/// Returns a [LuaError] if `tostring` is missing, non-callable, or raises an error inside a
-/// metamethod.
-fn format_lua_value(lua: &Lua, value: LuaValue) -> LuaResult<String> {
-    let tostring: LuaFunction = lua.globals().get("tostring")?;
-    tostring.call(value)
-}
-
-/// Formats a sequence of Lua values into a single tab-separated line.
-///
-/// - `lua`: active Lua virtual machine providing global value formatting.
-/// - `values`: ordered Lua values returned or passed to print.
-///
-/// # Errors
-///
-/// Returns a [LuaError] if formatting any element via [format_lua_value] fails.
-fn format_multi_value(lua: &Lua, values: LuaMultiValue) -> LuaResult<String> {
-    let mut parts = Vec::with_capacity(values.len());
-    for value in values {
-        parts.push(format_lua_value(lua, value)?);
-    }
-    Ok(parts.join("\t"))
-}
-
-/// Creates a Lua virtual machine with its print output routed to an in-memory buffer.
-///
-/// Replaces the default global `print` binding with a Rust callback backed by [OutputBuffer]. Each
-/// call formats its variadic arguments through [format_lua_value], joins them with horizontal
-/// tabs, and records one line per call.
-///
-/// # Errors
-///
-/// Returns a [LuaError] if creating or registering the print callback fails.
-fn create_lua_vm() -> LuaResult<(Lua, OutputBuffer)> {
-    let lua = Lua::new();
-    let output: OutputBuffer = Rc::new(RefCell::new(Vec::new()));
-    let sink = Rc::clone(&output);
-
-    let print_fn = lua.create_function(move |lua, args: LuaMultiValue| {
-        let line = format_multi_value(lua, args)?;
-        sink.borrow_mut().push(line);
-        Ok(())
-    })?;
-    lua.globals().set("print", print_fn)?;
-
-    Ok((lua, output))
-}
-
-/// Evaluates one line of Lua source and returns all captured print and return lines.
-///
-/// Clears `output` at the start of the call. First attempts to compile the input as a return
-/// expression without executing it; if that succeeds, runs the compiled function once, and
-/// otherwise falls back to evaluating `source` as a statement chunk. Appends any non-empty
-/// returned values formatted through [format_lua_value] after captured print lines.
-///
-/// - `lua`: shared Lua virtual machine whose global state persists across turns.
-/// - `output`: buffer bound to Lua's global print callback for capturing lines during execution.
-/// - `source`: user-entered Lua expression or statement text.
-///
-/// # Errors
-///
-/// Returns a [LuaError] if `source` has invalid syntax or fails at runtime. Any print lines
-/// emitted before a runtime failure remain available in `output`.
-fn eval_lua_line(lua: &Lua, output: &OutputBuffer, source: &str) -> LuaResult<Vec<String>> {
-    output.borrow_mut().clear();
-
-    // Compile-only check distinguishes expressions from statements without double execution.
-    let values = match lua.load(format!("return {source}")).into_function() {
-        Ok(func) => func.call::<LuaMultiValue>(())?,
-        Err(_) => lua.load(source).eval::<LuaMultiValue>()?,
-    };
-
-    let mut lines = std::mem::take(&mut *output.borrow_mut());
-    if !values.is_empty() {
-        lines.push(format_multi_value(lua, values)?);
-    }
-    Ok(lines)
-}
-
-/// Reads one line from standard input with trailing line endings removed.
-///
-/// Blocks the calling thread until standard input produces a newline or reaches end-of-file.
-/// Returns [None] at end-of-file, or the entered line stripped of trailing carriage-return and
-/// newline characters.
-///
-/// # Errors
-///
-/// Returns any standard-input error, including non-UTF-8 byte sequences.
-fn read_input() -> io::Result<Option<String>> {
-    let mut line = String::new();
-    let bytes = io::stdin().read_line(&mut line)?;
-    if bytes == 0 {
-        return Ok(None);
-    }
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
-}
-
-/// Runs the interactive prompt loop until the user quits or closes standard input.
-///
-/// Displays the welcome panel, then prompts once per turn and reads one input line until either
-/// end-of-file or [ReplCommand::Quit] arrives. Blank lines re-prompt without touching Lua, help
-/// commands display the command panel, and Lua chunks write print output, expression values, or
-/// formatted errors to standard output.
-///
-/// - `lua`: initialized Lua virtual machine whose global state persists across turns.
-/// - `output`: buffer populated by Lua's global print callback during chunk evaluation.
-///
-/// # Errors
-///
-/// Returns any unrecoverable standard-input or standard-output error encountered during the loop.
-fn run_repl(lua: &Lua, output: &OutputBuffer) -> io::Result<()> {
-    let inline_cursor = io::stdin().is_terminal() && io::stdout().is_terminal();
-    render_banner()?;
-
-    loop {
-        render_prompt(inline_cursor)?;
-        let Some(line) = read_input()? else {
-            if inline_cursor {
-                println!();
-            }
-            break;
+        let next_seed = if fresh_seed {
+            roll_random_seed()
+        } else if declared.is_some() && (self.world.is_none() || declared != self.last_declared_seed)
+        {
+            declared.unwrap_or(self.seed)
+        } else {
+            self.seed
         };
 
-        match parse_command(&line) {
-            ReplCommand::Blank => continue,
-            ReplCommand::Quit => break,
-            ReplCommand::Help => render_help()?,
-            ReplCommand::Eval(source) => match eval_lua_line(lua, output, source) {
-                Ok(lines) => render_output(&lines)?,
-                Err(err) => {
-                    // Flush any lines printed before the runtime failure occurred.
-                    let partial = std::mem::take(&mut *output.borrow_mut());
-                    render_output(&partial)?;
-                    render_error(&err)?;
+        let (entities, hud, init_prints) = candidate.init(next_seed)?;
+        let store = EntityStore::from_entities(entities);
+        let mut camera = Camera::default();
+        if let Some(player) = store.player() {
+            camera.snap_to(player.pos);
+        }
+
+        let bounds = camera.bounds(candidate.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+        let (terrain, view_prints) = candidate.view(bounds, 0)?;
+
+        self.world = Some(candidate);
+        self.last_declared_seed = declared;
+        self.seed = next_seed;
+        self.store = store;
+        self.camera = camera;
+        self.terrain = terrain;
+        self.tick = 0;
+        self.paused = false;
+        self.pending_tick_intent = None;
+        self.cadence.reset();
+        self.error_overlay = None;
+        self.hud_status = hud.status.unwrap_or_default();
+        self.log.clear();
+
+        for line in init_prints.into_iter().chain(view_prints) {
+            self.log.push_line(line);
+        }
+        if announce_reload {
+            self.log.push_line(format!(
+                "Reloaded {} -> t=0 (seed {:04X})",
+                self.script_path.display(),
+                self.seed & 0xffff
+            ));
+        }
+        if let Some(msg) = hud.message {
+            self.log.push_line(msg);
+        }
+
+        if announce_reload {
+            self.reload_flash_until = Some(now + RELOAD_FLASH_DURATION);
+        }
+        self.schedule_next_step_from(now);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Re-initializes the currently loaded world back to step zero without recompiling from disk.
+    fn reset_loaded_world(&mut self, now: Instant, fresh_seed: bool) {
+        if fresh_seed {
+            self.seed = roll_random_seed();
+        }
+        let Some(world) = self.world.as_ref() else {
+            if let Err(err) = self.reload_from_disk(now, fresh_seed, true) {
+                self.set_error(err.to_string());
+            }
+            return;
+        };
+
+        let init_outcome = world.init(self.seed).and_then(|(entities, hud, init_prints)| {
+            let store = EntityStore::from_entities(entities);
+            let mut camera = Camera::default();
+            if let Some(player) = store.player() {
+                camera.snap_to(player.pos);
+            }
+            let bounds = camera.bounds(world.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+            let (terrain, view_prints) = world.view(bounds, 0)?;
+            Ok((store, camera, terrain, hud, init_prints, view_prints))
+        });
+
+        match init_outcome {
+            Ok((store, camera, terrain, hud, init_prints, view_prints)) => {
+                self.store = store;
+                self.camera = camera;
+                self.terrain = terrain;
+                self.tick = 0;
+                self.paused = false;
+                self.pending_tick_intent = None;
+                self.cadence.reset();
+                self.error_overlay = None;
+                self.hud_status = hud.status.unwrap_or_default();
+                self.log.clear();
+                for line in init_prints.into_iter().chain(view_prints) {
+                    self.log.push_line(line);
                 }
-            },
+                self.log
+                    .push_line(format!("Reset -> t=0 (seed {:04X})", self.seed & 0xffff));
+                if let Some(msg) = hud.message {
+                    self.log.push_line(msg);
+                }
+                self.schedule_next_step_from(now);
+                self.dirty = true;
+            }
+            Err(err) => self.set_error(err.to_string()),
+        }
+    }
+
+    /// Executes one simulation step and refreshes terrain for the active camera.
+    fn execute_step(&mut self, intents: Vec<Intent>, now: Instant) -> LuaResult<()> {
+        let Some(world) = self.world.as_ref() else {
+            return Ok(());
+        };
+
+        let next_tick = self.tick.saturating_add(1);
+        let (patches, hud, step_prints) = world.step(next_tick, &intents, &self.store)?;
+
+        self.tick = next_tick;
+        self.store.apply_patches(&patches);
+
+        let cell_width = world.config().cell_width;
+        if let Some(player) = self.store.player() {
+            self.camera
+                .follow_deadzone(player.pos, cell_width.viewport_cols(), VIEWPORT_ROWS);
+        }
+
+        for line in step_prints {
+            self.log.push_line(line);
+        }
+        if let Some(status) = hud.status {
+            self.hud_status = status;
+        }
+        if let Some(msg) = hud.message {
+            self.log.push_line(msg);
+        }
+
+        let bounds = self
+            .camera
+            .bounds(cell_width.viewport_cols(), VIEWPORT_ROWS);
+        let (terrain, view_prints) = world.view(bounds, self.tick)?;
+        for line in view_prints {
+            self.log.push_line(line);
+        }
+        self.terrain = terrain;
+        self.schedule_next_step_from(now);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Refreshes terrain for the current camera without advancing simulation time.
+    fn refresh_view_only(&mut self) {
+        let Some(world) = self.world.as_ref() else {
+            return;
+        };
+        let bounds = self
+            .camera
+            .bounds(world.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+        match world.view(bounds, self.tick) {
+            Ok((terrain, view_prints)) => {
+                for line in view_prints {
+                    self.log.push_line(line);
+                }
+                self.terrain = terrain;
+                self.dirty = true;
+            }
+            Err(err) => self.set_error(err.to_string()),
+        }
+    }
+
+    /// Records a script failure into the error modal and pauses automatic stepping.
+    fn set_error(&mut self, message: String) {
+        self.error_overlay = Some(message);
+        self.paused = true;
+        self.next_step_at = None;
+        self.dirty = true;
+    }
+
+    /// Schedules the next timed step deadline based on pacing mode and pause state.
+    fn schedule_next_step_from(&mut self, now: Instant) {
+        if self.paused || self.error_overlay.is_some() {
+            self.next_step_at = None;
+            return;
+        }
+        let pacing = self
+            .world
+            .as_ref()
+            .map_or(Pacing::default(), |w| w.config().pacing);
+        self.next_step_at = match pacing {
+            Pacing::Turn => None,
+            Pacing::Tick { tick_ms } => Some(now + Duration::from_millis(tick_ms)),
+            Pacing::Hybrid { idle_ms } => Some(now + Duration::from_millis(idle_ms)),
+        };
+    }
+
+    /// Computes the poll sleep duration in milliseconds capped for prompt file-watch checks.
+    fn poll_timeout_ms(&self, now: Instant) -> i32 {
+        let mut wait_ms = WATCH_POLL_CAP_MS;
+
+        if let Some(deadline) = self.next_step_at {
+            let rem = deadline.saturating_duration_since(now).as_millis();
+            wait_ms = wait_ms.min(rem.min(i32::MAX as u128) as i32);
+        }
+        if let Some(flash_end) = self.reload_flash_until {
+            let rem = flash_end.saturating_duration_since(now).as_millis();
+            wait_ms = wait_ms.min(rem.min(i32::MAX as u128) as i32);
+        }
+
+        wait_ms.max(0)
+    }
+
+    /// Paints the current state onto the display buffer and flushes it if dirty.
+    fn render_if_dirty(&mut self, display: &mut Display, now: Instant) -> io::Result<()> {
+        let too_small = tty::terminal_size()
+            .filter(|&(cols, rows)| cols < FRAME_WIDTH as u16 || rows < FRAME_HEIGHT as u16 + 1);
+        if too_small != self.last_too_small {
+            self.last_too_small = too_small;
+            self.dirty = true;
+        }
+
+        if !self.dirty {
+            return Ok(());
+        }
+
+        let empty_palette = HashMap::new();
+        let (title, pacing, cell_width, palette) = match &self.world {
+            Some(world) => (
+                world.config().title.as_str(),
+                world.config().pacing,
+                world.config().cell_width,
+                world.palette(),
+            ),
+            None => ("turtle", Pacing::Turn, CellWidth::Two, &empty_palette),
+        };
+
+        let reload_flash = self.reload_flash_until.is_some_and(|end| now < end);
+        let bounds = self
+            .camera
+            .bounds(cell_width.viewport_cols(), VIEWPORT_ROWS);
+
+        let frame = FrameState {
+            title,
+            pacing,
+            cell_width,
+            tick: self.tick,
+            seed: self.seed,
+            paused: self.paused,
+            reload_flash,
+            bounds,
+            terrain: &self.terrain,
+            entities: &self.store,
+            palette,
+            camera_center: self.camera.center,
+            hud_status: &self.hud_status,
+            log: &self.log,
+            error_overlay: self.error_overlay.as_deref(),
+            terminal_too_small: too_small,
+        };
+
+        render::compose_frame(display, &frame);
+        display.print()?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+/// Parses command-line arguments selecting the script path and optional headless step count.
+///
+/// # Errors
+///
+/// Returns a descriptive usage message if an unknown flag or invalid step count is supplied.
+fn parse_cli_args() -> Result<CliOptions, String> {
+    let mut script_path: Option<PathBuf> = None;
+    let mut max_steps: Option<u64> = None;
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                return Err(
+                    "Usage: turtle [script.lua] [--steps N]\nDefaults to world.lua when no script path is given."
+                        .to_string(),
+                );
+            }
+            "--steps" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--steps requires a non-negative integer".to_string())?;
+                let parsed: u64 = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --steps value '{raw}': expected integer"))?;
+                max_steps = Some(parsed);
+            }
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown option '{flag}' (pass --help for usage)"));
+            }
+            path_arg => {
+                if script_path.is_none() {
+                    script_path = Some(PathBuf::from(path_arg));
+                } else {
+                    return Err(format!("unexpected extra argument '{path_arg}'"));
+                }
+            }
+        }
+    }
+
+    Ok(CliOptions {
+        script_path: script_path.unwrap_or_else(|| PathBuf::from("world.lua")),
+        max_steps,
+    })
+}
+
+/// Collapses batched raw events so repeated directional keys keep only the latest direction.
+fn coalesce_player_actions(events: Vec<RawInput>) -> (Vec<RawInput>, Option<Action>) {
+    let mut controls = Vec::new();
+    let mut latest_move: Option<Action> = None;
+    let mut explicit_action: Option<Action> = None;
+
+    for ev in events {
+        match ev {
+            RawInput::Action(action @ Action::Move { .. }) => latest_move = Some(action),
+            RawInput::Action(action) => explicit_action = Some(action),
+            other => controls.push(other),
+        }
+    }
+
+    // Prefer a deliberate Wait or Act over an accidental earlier movement, unless Move came too.
+    let chosen = latest_move.or(explicit_action);
+    (controls, chosen)
+}
+
+/// Applies one player or cursor action according to entity presence and the active pacing mode.
+fn dispatch_player_action(state: &mut EngineState, action: Action, now: Instant) {
+    if state.error_overlay.is_some() {
+        return;
+    }
+
+    if let Some(player) = state.store.player().cloned() {
+        if let Action::Move { dx, dy } = action {
+            let pacing = state
+                .world
+                .as_ref()
+                .map_or(Pacing::default(), |w| w.config().pacing);
+            if !matches!(pacing, Pacing::Tick { .. }) && !state.cadence.allow_move(dx, dy, now) {
+                return;
+            }
+        }
+
+        let intent = Intent {
+            entity_id: player.id,
+            action,
+            origin: player.pos,
+        };
+        let pacing = state
+            .world
+            .as_ref()
+            .map_or(Pacing::default(), |w| w.config().pacing);
+
+        match pacing {
+            Pacing::Tick { .. } => state.pending_tick_intent = Some(intent),
+            Pacing::Turn | Pacing::Hybrid { .. } => {
+                if let Err(err) = state.execute_step(vec![intent], now) {
+                    state.set_error(err.to_string());
+                }
+            }
+        }
+        return;
+    }
+
+    // Playerless worlds (such as cellular automata) pan the camera directly and toggle at center.
+    match action {
+        Action::Move { dx, dy } => {
+            state.camera.pan(dx, dy);
+            state.refresh_view_only();
+        }
+        Action::Act => {
+            let intent = Intent {
+                entity_id: "$cursor".to_string(),
+                action: Action::Act,
+                origin: state.camera.center,
+            };
+            if let Err(err) = state.execute_step(vec![intent], now) {
+                state.set_error(err.to_string());
+            }
+        }
+        Action::Wait => {
+            if let Err(err) = state.execute_step(Vec::new(), now) {
+                state.set_error(err.to_string());
+            }
+        }
+    }
+}
+
+/// Generates a compact random seed from monotonic clock nanoseconds.
+fn roll_random_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(42, |d| d.as_nanos());
+    ((nanos ^ (nanos >> 16)) & 0xffff) as u64
+}
+
+/// Creates a blank black terrain grid matching the active tile width.
+fn default_blank_terrain(cell_width: CellWidth) -> Vec<Vec<TileStyle>> {
+    let style = TileStyle::from_spec(" ", Colour::White, Some(Colour::Black));
+    vec![vec![style; cell_width.viewport_cols()]; VIEWPORT_ROWS]
+}
+
+/// Runs fixed-step non-interactive smoke frames and exits cleanly.
+fn run_smoke_steps(state: &mut EngineState, display: &mut Display, steps: u64) -> LuaResult<()> {
+    let now = Instant::now();
+    state.reload_from_disk(now, false, false)?;
+    if let Err(err) = state.render_if_dirty(display, now)
+        && err.kind() != ErrorKind::BrokenPipe
+    {
+        return Err(LuaError::external(err));
+    }
+
+    for _ in 0..steps {
+        let step_now = Instant::now();
+        state.execute_step(Vec::new(), step_now)?;
+        if let Err(err) = state.render_if_dirty(display, step_now) {
+            if err.kind() == ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(LuaError::external(err));
         }
     }
 
     Ok(())
 }
 
-/// Initializes the embedded Lua virtual machine and drives the terminal session loop.
-///
-/// Treats a broken standard-output pipe as a clean exit so piped invocations terminate quietly.
+/// Runs the interactive raw-mode event loop until the user quits or closes input.
+fn run_interactive(state: &mut EngineState, display: &mut Display) -> io::Result<()> {
+    let start = Instant::now();
+    if let Err(err) = state.reload_from_disk(start, false, false) {
+        state.set_error(err.to_string());
+    }
+    state.render_if_dirty(display, start)?;
+
+    loop {
+        let now = Instant::now();
+
+        if let Some(flash_end) = state.reload_flash_until
+            && now >= flash_end
+        {
+            state.reload_flash_until = None;
+            state.dirty = true;
+        }
+
+        if state.watcher.poll_changed(now)
+            && let Err(err) = state.reload_from_disk(now, false, true)
+        {
+            state.set_error(err.to_string());
+        }
+
+        let timeout_ms = state.poll_timeout_ms(now);
+        let events = tty::poll_and_drain_inputs(timeout_ms)?;
+        let step_now = Instant::now();
+        let (controls, player_action) = coalesce_player_actions(events);
+
+        for cmd in controls {
+            match cmd {
+                RawInput::Quit => return Ok(()),
+                RawInput::DismissOverlay => {
+                    if state.error_overlay.take().is_some() {
+                        state.dirty = true;
+                    }
+                }
+                RawInput::TogglePause => {
+                    state.paused = !state.paused;
+                    state.schedule_next_step_from(step_now);
+                    state.dirty = true;
+                }
+                RawInput::StepOnce => {
+                    state.paused = true;
+                    state.next_step_at = None;
+                    let intent = state.pending_tick_intent.take().into_iter().collect();
+                    if let Err(err) = state.execute_step(intent, step_now) {
+                        state.set_error(err.to_string());
+                    }
+                }
+                RawInput::ResetSameSeed => state.reset_loaded_world(step_now, false),
+                RawInput::ResetNewSeed => state.reset_loaded_world(step_now, true),
+                RawInput::Action(_) => {}
+            }
+        }
+
+        if let Some(action) = player_action {
+            dispatch_player_action(state, action, step_now);
+        }
+
+        if let Some(deadline) = state.next_step_at
+            && !state.paused
+            && state.error_overlay.is_none()
+            && step_now >= deadline
+        {
+            let intent = state.pending_tick_intent.take().into_iter().collect();
+            if let Err(err) = state.execute_step(intent, step_now) {
+                state.set_error(err.to_string());
+            }
+        }
+
+        if let Err(err) = state.render_if_dirty(display, Instant::now()) {
+            if err.kind() == ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(err);
+        }
+    }
+}
+
+/// Parses arguments, prepares the terminal grid, runs the simulation, and restores shell state.
 ///
 /// # Errors
 ///
-/// Returns a [LuaError] if creating the Lua virtual machine fails or if terminal I/O fails with
-/// an error other than a broken pipe.
+/// Returns a [LuaError] if command-line parsing fails, if terminal initialization fails, or if a
+/// non-interactive smoke run fails to load or step its script.
 fn main() -> LuaResult<()> {
-    let (lua, output) = create_lua_vm()?;
-    match run_repl(&lua, &output) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(err) => Err(LuaError::external(err)),
+    let options = parse_cli_args().map_err(LuaError::external)?;
+    let _guard = TerminalGuard::enter().map_err(LuaError::external)?;
+
+    let mut display = Display::new(FRAME_WIDTH, FRAME_HEIGHT);
+    if let Err(err) = display.reserve_space() {
+        if err.kind() == ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(LuaError::external(err));
     }
+
+    let mut state = EngineState::new(options.script_path);
+    let result = match options.max_steps {
+        Some(steps) => run_smoke_steps(&mut state, &mut display, steps),
+        None => run_interactive(&mut state, &mut display).map_err(|err| {
+            if err.kind() == ErrorKind::BrokenPipe {
+                return LuaError::external("broken pipe");
+            }
+            LuaError::external(err)
+        }),
+    };
+
+    drop(_guard);
+    println!();
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests covering command parsing, wrapping, terminal grid rendering, and Lua execution.
+    //! Unit tests verifying CLI option parsing and batched input coalescing.
 
     use super::*;
 
-    fn row_text(display: &Display, y: isize) -> String {
-        (0..display.width() as isize)
-            .map(|x| display.pixel(x, y).unwrap().character())
-            .collect()
-    }
-
     #[test]
-    fn parse_command_classifies_builtins_and_preserves_lua() {
-        assert!(matches!(parse_command(""), ReplCommand::Blank));
-        assert!(matches!(parse_command("   \t "), ReplCommand::Blank));
-        assert!(matches!(parse_command("help"), ReplCommand::Help));
-        assert!(matches!(parse_command("  help  "), ReplCommand::Help));
-        assert!(matches!(parse_command("quit"), ReplCommand::Quit));
-        assert!(matches!(parse_command(" quit "), ReplCommand::Quit));
-        assert!(matches!(parse_command("quit()"), ReplCommand::Eval("quit()")));
-        assert!(matches!(
-            parse_command("  x = 1  "),
-            ReplCommand::Eval("  x = 1  ")
-        ));
-    }
-
-    #[test]
-    fn wrap_lines_normalizes_tabs_carriage_returns_and_widths() {
-        assert_eq!(wrap_lines("", 10), vec![""]);
-        assert_eq!(wrap_lines("a\tb\r\nc", 20), vec!["a    b", "c"]);
-        assert_eq!(wrap_lines("abcdef", 4), vec!["abcd", "ef"]);
-        assert_eq!(wrap_lines("é☂xyz", 2), vec!["é☂", "xy", "z"]);
-    }
-
-    #[test]
-    fn eval_handles_expressions_persistence_and_print_capture() {
-        let (lua, output) = create_lua_vm().unwrap();
-
-        assert_eq!(eval_lua_line(&lua, &output, "1 + 2").unwrap(), vec!["3"]);
-        assert!(eval_lua_line(&lua, &output, "x = 40").unwrap().is_empty());
-        assert_eq!(eval_lua_line(&lua, &output, "x + 2").unwrap(), vec!["42"]);
-        assert_eq!(
-            eval_lua_line(&lua, &output, "print('a', 2, nil)").unwrap(),
-            vec!["a\t2\tnil"]
-        );
-        assert_eq!(
-            eval_lua_line(&lua, &output, "nil").unwrap(),
-            vec!["nil"]
-        );
-    }
-
-    #[test]
-    fn eval_executes_phase_one_main_lua_file() {
-        let (lua, output) = create_lua_vm().unwrap();
-        let lines = eval_lua_line(&lua, &output, "dofile(\"main.lua\")").unwrap();
-        assert_eq!(
-            lines,
-            vec![
-                "main.lua loaded and executed successfully",
-                "Phase 1 validated",
-            ]
-        );
-    }
-
-    #[test]
-    fn eval_does_not_double_execute_on_runtime_error() {
-        let (lua, output) = create_lua_vm().unwrap();
-        let err = eval_lua_line(
-            &lua,
-            &output,
-            "counter = (counter or 0) + 1; error('boom')",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("boom"));
-        assert_eq!(
-            eval_lua_line(&lua, &output, "counter").unwrap(),
-            vec!["1"]
-        );
-
-        let expr_err = eval_lua_line(
-            &lua,
-            &output,
-            "((function() hits = (hits or 0) + 1; error('bang') end)())",
-        )
-        .unwrap_err();
-        assert!(expr_err.to_string().contains("bang"));
-        assert_eq!(eval_lua_line(&lua, &output, "hits").unwrap(), vec!["1"]);
-    }
-
-    #[test]
-    fn eval_reports_syntax_errors() {
-        let (lua, output) = create_lua_vm().unwrap();
-        assert!(eval_lua_line(&lua, &output, "1 +").is_err());
-    }
-
-    #[test]
-    fn panel_and_output_displays_render_wrapped_text_on_black_background() {
-        let panel = build_panel_display(&[("hello\tworld", Colour::BrightCyan)], Colour::Cyan);
-        assert_eq!(panel.pixel(0, 0).unwrap().character(), '┌');
-        assert_eq!(panel.pixel(1, 1).unwrap().background(), Colour::Black);
-        assert!(row_text(&panel, 1).contains("hello    world"));
-
-        assert!(build_lines_display(&[], Colour::BrightWhite).is_none());
-        let lines = build_lines_display(&["alpha\tbeta\ngamma".to_string()], Colour::BrightWhite)
-            .unwrap();
-        assert_eq!(lines.height(), 2);
-        assert_eq!(lines.pixel(0, 0).unwrap().background(), Colour::Black);
-        assert_eq!(lines.pixel(71, 0).unwrap().background(), Colour::Black);
-        assert!(row_text(&lines, 0).starts_with("alpha    beta"));
-        assert!(row_text(&lines, 1).starts_with("gamma"));
+    fn coalesces_repeated_directional_keys_to_latest_move() {
+        let events = vec![
+            RawInput::Action(Action::Move { dx: 1, dy: 0 }),
+            RawInput::Action(Action::Move { dx: 1, dy: 0 }),
+            RawInput::Action(Action::Move { dx: 0, dy: -1 }),
+            RawInput::TogglePause,
+        ];
+        let (controls, action) = coalesce_player_actions(events);
+        assert_eq!(controls, vec![RawInput::TogglePause]);
+        assert_eq!(action, Some(Action::Move { dx: 0, dy: -1 }));
     }
 }

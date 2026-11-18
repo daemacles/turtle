@@ -251,6 +251,7 @@ checksum = "bdc199b6b21b2a866a7a8b079aeba599768b727647f44107c7a239c7b7c206b6"
 name = "turtle"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mlua",
  "terminal_graphics",
 ]

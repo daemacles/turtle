@@ -8,6 +8,8 @@ edition = "2024"
 mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
 # terminal_graphics: render colored text in the terminal.
 terminal_graphics = "1.1"
+# libc: POSIX termios raw mode, non-blocking poll, and terminal window size queries.
+libc = "0.2"
 
 # dexiotites:begin doc lints (managed by dexiotites install.py; rerun it to update)
 # Tier 1 documentation enforcement for Rust (Cargo 1.74+ `[lints]` tables).
