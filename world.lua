@@ -32,17 +32,24 @@ world.pacing = { mode = "hybrid", idle_ms = 650 }
 
 --- Visual legend pairing short terrain and actor keys with sixteen-color terminal styles.
 world.palette = {
-    ["~"] = { "≈~", "BrightCyan", "Blue" },
-    ["w"] = { "~≈", "Cyan", "Blue" },
-    [","] = { " ·", "BrightCyan", "Blue" },
-    ["."] = { " ·", "Yellow", "Black" },
-    ['"'] = { " ,", "Green", "Black" },
-    ["#"] = { "▒▒", "White", "BrightBlack" },
-    ["="] = { "==", "BrightYellow", "Blue" },
-    ["@"] = { "@ ", "BrightYellow" },
-    ["B"] = { "[]", "Yellow" },
-    ["G"] = { "<>", "BrightCyan" },
-    ["C"] = { "><", "BrightRed" },
+    -- Entry format: { 2-char glyph, fg Colour, bg Colour? }.
+    -- Terrain sets an explicit background for spatial mass (Blue water, Black land, BrightBlack
+    -- stone); actors omit bg (nil) so Rust composites them transparently over terrain.
+
+    -- Terrain tiles:
+    ["~"] = { "≈~", "BrightCyan", "Blue" },   -- Deep ocean crest; impassable, bridgeable with crates.
+    ["w"] = { "~≈", "Cyan", "Blue" },         -- Deep ocean shimmer frame alternated by world.view.
+    [","] = { " ·", "BrightCyan", "Blue" },   -- Coastal shoals with sea spray; impassable water.
+    ["."] = { " ·", "Yellow", "Black" },      -- Sandy beach / dry shore; walkable.
+    ['"'] = { " ,", "Green", "Black" },       -- Grassy island interior turf; walkable.
+    ["#"] = { "▒▒", "White", "BrightBlack" }, -- Stone ruins / sea cliffs; blocks actors and crates.
+    ["="] = { "==", "BrightYellow", "Blue" }, -- Driftwood plank bridge over water; walkable.
+
+    -- Overlaid entities (bg = nil inherits underlying terrain background):
+    ["@"] = { "@ ", "BrightYellow" },         -- Explorer / player hero.
+    ["B"] = { "[]", "Yellow" },               -- Driftwood crate; slides on land, bridges water.
+    ["G"] = { "<>", "BrightCyan" },           -- Sun Gem facet; collectible goal item.
+    ["C"] = { "><", "BrightRed" },            -- Reef Crab pincers; patrolling hazard.
 }
 
 --- Encodes signed integer coordinates into a sparse lookup key.
@@ -59,13 +66,32 @@ end
 ---@param seed integer Deterministic world seed.
 ---@return number height Elevation scalar centered near zero.
 local function elevation(x, y, seed)
+    -- Three-octave trigonometric wave synthesis: an O(1) stateless stand-in for 2D gradient noise
+    -- so any (x, y) tile evaluates independently without precomputing a grid or permutation table.
+    -- All numeric coefficients below are hand-tuned heuristics rather than physical constants.
+
+    -- 1. Seed-to-phase projection: split seed across coprime moduli 97 and 89 (8,633 unique phase
+    -- pairs) with radian steps 0.13 and 0.17 (each spanning > 2*pi across its modulus range) so
+    -- consecutive seeds shift X and Y phases independently instead of sliding diagonally in sync.
     local p1 = (seed % 97) * 0.13
     local p2 = ((math.floor(seed / 97)) % 89) * 0.17
+
+    -- 2. Base island lattice (Octave 1): asymmetric spatial frequencies 0.24 and 0.28 rad/tile give
+    -- wavelengths of ~26 tiles east-west and ~22 tiles north-south, fitting ~2-3 island-and-channel
+    -- cycles across the viewport without square-grid alignment.
     local fx = x * 0.24 + p1
     local fy = y * 0.28 + p2
+
+    -- Multiplying sin(fx) * cos(fy) forms an alternating 2D lattice of hills (+1) and basins (-1);
+    -- adding two weaker diagonal harmonics with decaying weights (1.0, 0.45, 0.25) and
+    -- non-integer ratios (1.9/1.3 and opposing 0.61*x - 0.53*y) breaks checkerboard symmetry into
+    -- irregular bays, peninsulas, and narrow straits without obvious repeating seams.
     local wave = math.sin(fx) * math.cos(fy)
         + 0.45 * math.sin(fx * 1.9 + fy * 1.3 + p2)
         + 0.25 * math.cos(x * 0.61 - y * 0.53 + p1)
+
+    -- 3. Amplitude scaling: worst-case octave sum is 1.0 + 0.45 + 0.25 = 1.70; scaling by 0.55
+    -- keeps values in [-0.935, +0.935] inside [-1, 1] so SEA_LEVEL in terrain_at sweeps smoothly.
     return wave * 0.55
 end
 
