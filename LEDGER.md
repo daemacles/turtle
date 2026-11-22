@@ -4,7 +4,7 @@
 
 ## Project snapshot
 - Name: **turtle** — learning project for embedding Lua in Rust.
-- Location: workspace dir `lmstudio/`; git repo rooted at `turtle/`, branch `main`, no remote yet.
+- Location: workspace dir `lmstudio/`; git repo rooted at `turtle/`, branch `main`, tracking `origin/main`.
 - Stack: Rust 1.95, `mlua` v0.12.2 pinned with features `["lua54", "vendored"]`, `terminal_graphics` v1.1.0, `libc` v0.2 (POSIX raw `termios` / `poll` / `TIOCGWINSZ`, already resolved in `Cargo.lock`).
 - Process rule (user-set): user validates each phase (`cargo run`) before authorizing the next; Phase 2+ are TBD until after Phase 1 is validated.
 
@@ -14,10 +14,11 @@
 | 0     | Rust app runs inline Lua code that prints `hello, world`                                                                                       | ✅ built & smoke-tested locally — validated by user (2026-11-14)          |
 | 1     | Load and execute a hardcoded `main.lua` file next to the project. Assumed location: CWD-relative `turtle/main.lua`, invoked from inside `turtle/` | ✅ built & smoke-tested locally — validated by user (2026-11-14)          |
 | 2     | Interactive Lua REPL with `terminal_graphics` rendering                                                                                        | ✅ built & smoke-tested locally — validated by user (2026-11-18)         |
-| 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`, raw-mode input, hot-reload)    | ✅ built & smoke-tested locally (2026-11-18) — awaiting user validation   |
+| 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`, raw-mode input, hot-reload)    | ✅ built & smoke-tested locally (2026-11-18) — validated by user (2026-11-22) |
 
 ## Current state (most recent)
-- Phase 3 V1 implemented across `src/model.rs`, `src/tty.rs`, `src/lua_host.rs`, `src/render.rs`, `src/main.rs`, `world.lua` (*Tidekeep*), `examples/life.lua`, and `examples/simple_room.lua`.
+- Phase 3 V1 is validated by the user (2026-11-22). Before moving to Phase 3 V2, `TURTLE_SPEC.md` (clean-room functional spec + evaluation rubric), `TURTLE_P3V1_ABI.md` (exact Phase 3 V1 host–script ABI conformance spec), and `RETROSPECTIVE_P3V1.md` (session narrative, terms of art, and worked prompting example) were created at the repository root.
+- Phase 3 V1 is implemented across `src/model.rs`, `src/tty.rs`, `src/lua_host.rs`, `src/render.rs`, `src/main.rs`, `world.lua` (*Tidekeep*), `examples/life.lua`, and `examples/simple_room.lua` (plus user doc updates to `world.lua` in commit `e76905c`).
 - CLI defaults to `world.lua` with `argv[1]` selecting alternate scripts and `--steps N` supporting bounded smoke runs; the Phase 2 REPL was removed as planned now that Phase 2 served its validation purpose.
 - Rust owns `EntityStore` (seeded by `world.init(seed)` and mutated by `world.step(t, requests, entities)` delta patches), fixed `78×23` `terminal_graphics` rendering (`37×17` at `cell_width = 2`, `75×17` at `cell_width = 1`, transparent `bg = nil` inheritance + contrast guard), raw-mode `termios`/`poll` input with `Drop` + panic restore, and atomic Shadow-VM hot-reload back to `t = 0` on script edit (preserving frozen frames inside a red error overlay if mid-edit syntax errors occur).
 - `main.lua` remains preserved at the repository root.
@@ -54,7 +55,8 @@ cd turtle && cargo test && cargo run -- --steps 4
 12. **V2 ECS seam**: `model::EntityStore` (`EntityId -> Coord, tile, is_player`) owns entity storage independently of `lua_host`, `tty`, and `render` so V2 can evolve into a full ECS without rewriting the terminal or Lua ABI boundary.
 
 ## Next steps
-- [ ] Wait for user to validate Phase 3 V1 (`cargo run`, `cargo run -- examples/life.lua`, `cargo run -- examples/simple_room.lua`, and live `world.lua` editing).
+- [x] Wait for user to validate Phase 3 V1 (`cargo run`, `cargo run -- examples/life.lua`, `cargo run -- examples/simple_room.lua`, and live `world.lua` editing).
+- [ ] User runs external model evaluation against `TURTLE_SPEC.md` and `TURTLE_P3V1_ABI.md` (optional side quest before V2).
 - [ ] On user go-ahead: plan and implement Phase 3 V2 (Entity Component System + next features).
 
 ## Session log (append-only)
@@ -82,3 +84,10 @@ cd turtle && cargo test && cargo run -- --steps 4
 - Authored `world.lua` (*Tidekeep* procedural archipelago with crate bridges, Sun Gems, and Reef Crabs), `examples/life.lua` (sparse Game of Life with camera pan & toggle), and `examples/simple_room.lua` (turn-based puzzle room).
 - Verified `cargo test` (13 passed), `cargo clippy --all-targets -- -D warnings -D missing_docs`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, LuaLS (`4/4` clean), `comment_load.py --fail-over 0` (`0` warnings across all 8 files), `--steps 4` runs, and PTY interactive + live Shadow-VM hot-reload tests.
 - Updated `README.md` and `LEDGER.md`.
+
+### 2026-11-22 — session 5 (Phase 3 V1 validation + evaluation specs)
+- User validated Phase 3 V1 and requested clean-room + ABI conformance specs for evaluating another model prior to Phase 3 V2, plus a session retrospective.
+- Created `TURTLE_SPEC.md` (clean-room functional requirements for the engine + all 3 world archetypes, V2 ECS modularity seam, automated checks, and human validation rubric; no crate/version prescriptions).
+- Created `TURTLE_P3V1_ABI.md` (exact Phase 3 V1 host–script ABI specification matching unmodified `world.lua`, `examples/life.lua`, and `examples/simple_room.lua` for Stage 2 conformance testing).
+- Created `RETROSPECTIVE_P3V1.md` (narrative summary, terms-of-art glossary, and simulated worked prompting example).
+- Updated `README.md` and `LEDGER.md` with Phase 3 V1 validation status, `origin/main` tracking note, and links to the new docs.
