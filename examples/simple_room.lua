@@ -44,7 +44,6 @@ local ORIGIN_Y = -4
 local has_key = false
 local door_open = false
 local escaped = false
-local guard_dir = 1
 
 --- Reads the static or mutated room tile at integer world coordinates.
 ---@param x integer Eastward grid coordinate.
@@ -64,22 +63,20 @@ local function tile_at(x, y)
     return ch
 end
 
---- Resets room doors and spawns player, brass key, and patrolling sentinel.
+--- Resets room doors and spawns the player, brass key, and patrolling sentinel.
 ---@param _seed integer Seed ignored by this deterministic static puzzle room.
----@return table[] entities Starting player, key, and sentinel entities.
+---@param ecs any Scoped host entity-component world handle.
 ---@return table hud Initial status indicator and mission hint.
-function world.init(_seed)
+function world.init(_seed, ecs)
     has_key = false
     door_open = false
     escaped = false
-    guard_dir = 1
 
-    local entities = {
-        { id = "player", x = -4, y = -2, tile = "@", player = true },
-        { id = "key", x = -4, y = 2, tile = "K" },
-        { id = "guard", x = 3, y = 1, tile = "M" },
-    }
-    return entities, {
+    ecs:spawn({ name = "player", pos = { x = -4, y = -2 }, sprite = { tile = "@", layer = 10 }, player = true, solid = true })
+    ecs:spawn({ name = "key", pos = { x = -4, y = 2 }, sprite = { tile = "K", layer = 2 }, item = "brass_key" })
+    ecs:spawn({ name = "guard", pos = { x = 3, y = 1 }, sprite = { tile = "M", layer = 6 }, solid = true, patrol = { dir = 1 } })
+
+    return {
         status = "KEY: NO",
         msg = "Find the brass key (k-) to unlock the red gate and reach <>.",
     }
@@ -88,42 +85,50 @@ end
 --- Resolves player movement, door unlocking, shrine escape, and sentinel patrol.
 ---@param _t integer Current simulation step counter.
 ---@param requests table[] Player movement or wait intents for this turn.
----@param entities table<string, table> Snapshot of live entities keyed by identifier.
----@return table[] patches Entity position or removal updates produced by this turn.
+---@param ecs any Scoped host entity-component world handle.
 ---@return table hud Updated key status and event message.
-function world.step(_t, requests, entities)
-    local patches = {}
+function world.step(_t, requests, ecs)
     local msg = nil
-    local player = entities["player"]
-    local px = player and player.x or -4
-    local py = player and player.y or -2
+    local player_id = ecs:find_by_name("player")
+    local player_pos = player_id and ecs:get(player_id, "pos") or nil
+    local px = player_pos and player_pos.x or -4
+    local py = player_pos and player_pos.y or -2
+
+    local function find_at_with_component(tx, ty, comp)
+        for _, eid in ipairs(ecs:at(tx, ty)) do
+            if ecs:has(eid, comp) then
+                return eid
+            end
+        end
+        return nil
+    end
 
     for _, req in ipairs(requests) do
-        if req.id == "player" and req.action == "move" and (req.dx ~= 0 or req.dy ~= 0) then
+        if player_id and req.id == player_id and req.action == "move" and (req.dx ~= 0 or req.dy ~= 0) then
             local nx, ny = px + req.dx, py + req.dy
             local dest = tile_at(nx, ny)
-            local key_ent = entities["key"]
-            local guard_ent = entities["guard"]
+            local guard_hit = find_at_with_component(nx, ny, "patrol")
 
-            if guard_ent and guard_ent.x == nx and guard_ent.y == ny then
+            if guard_hit then
                 px, py = -4, -2
-                patches[#patches + 1] = { id = "player", x = px, y = py }
+                ecs:set(player_id, "pos", { x = px, y = py })
                 msg = "Sentinel bumped you back to the courtyard!"
             elseif dest == "+" then
                 if has_key then
                     door_open = true
                     px, py = nx, ny
-                    patches[#patches + 1] = { id = "player", x = px, y = py }
+                    ecs:set(player_id, "pos", { x = px, y = py })
                     msg = "Unlocked the gate with the brass key!"
                 else
                     msg = "The gate is locked. Grab the k- key south of you first."
                 end
             elseif dest == "." or dest == "/" or dest == "X" then
                 px, py = nx, ny
-                patches[#patches + 1] = { id = "player", x = px, y = py }
-                if key_ent and key_ent.x == nx and key_ent.y == ny then
+                ecs:set(player_id, "pos", { x = px, y = py })
+                local key_id = find_at_with_component(nx, ny, "item")
+                if key_id and ecs:get(key_id, "item") == "brass_key" then
                     has_key = true
-                    patches[#patches + 1] = { id = "key", remove = true }
+                    ecs:despawn(key_id)
                     msg = "Picked up the brass key!"
                 elseif dest == "X" and not escaped then
                     escaped = true
@@ -135,22 +140,25 @@ function world.step(_t, requests, entities)
         end
     end
 
-    local guard = entities["guard"]
-    if guard then
-        local gx = guard.x + guard_dir
-        local g_tile = tile_at(gx, guard.y)
-        if g_tile == "#" or (gx == px and guard.y == py) then
-            guard_dir = -guard_dir
-            if gx == px and guard.y == py then
-                msg = "The sentinel blocks the eastern passage."
+    for _, guard_id in ipairs(ecs:query("pos", "patrol")) do
+        local gpos = ecs:get(guard_id, "pos")
+        local patrol = ecs:get(guard_id, "patrol")
+        if gpos and patrol then
+            local gx = gpos.x + patrol.dir
+            local g_tile = tile_at(gx, gpos.y)
+            if g_tile == "#" or (gx == px and gpos.y == py) then
+                ecs:set(guard_id, "patrol", { dir = -patrol.dir })
+                if gx == px and gpos.y == py then
+                    msg = "The sentinel blocks the eastern passage."
+                end
+            else
+                ecs:set(guard_id, "pos", { x = gx, y = gpos.y })
             end
-        else
-            patches[#patches + 1] = { id = "guard", x = gx, y = guard.y }
         end
     end
 
     local key_tag = escaped and "ESCAPED!" or (has_key and "KEY: YES" or "KEY: NO")
-    return patches, { status = key_tag, msg = msg }
+    return { status = key_tag, msg = msg }
 end
 
 --- Renders the requested world viewport bounds as a two-dimensional key grid.

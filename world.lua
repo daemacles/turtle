@@ -1,8 +1,8 @@
 -- Tidekeep: default Phase 3 world script for turtle.
 -- Combines procedural archipelago terrain, pushable driftwood bridges, Sun Gems, and Reef Crabs
--- in Ultima-style hybrid pacing. Edit the constants below and save to hot-reload at t=0.
+-- in Ultima-style hybrid pacing using the host ECS API. Edit the constants below and save to hot-reload.
 
-local SEA_LEVEL = 0.14   -- Raise toward 0.45 to flood islands; lower toward -0.20 for Pangea.
+local SEA_LEVEL = -0.15   -- Raise toward 0.45 to flood islands; lower toward -0.20 for Pangea.
 local CRAB_PERIOD = 2    -- Crabs move every N steps; set 1 for intense chase or 99 for peaceful.
 local GEMS_GOAL = 5      -- Total Sun Gems placed around the starting archipelago.
 
@@ -183,11 +183,11 @@ local function format_status()
     return "GEMS " .. tostring(state.gems_found) .. "/" .. tostring(GEMS_GOAL)
 end
 
---- Initializes world state, starting hero, driftwood crates, Sun Gems, and Reef Crabs.
+--- Initializes world state and spawns the hero, driftwood crates, Sun Gems, and Reef Crabs.
 ---@param seed integer Deterministic random seed selected by the host engine.
----@return table[] entities Initial actor list registered with the host.
+---@param ecs any Scoped host entity-component world handle.
 ---@return table hud Initial status text and welcome message.
-function world.init(seed)
+function world.init(seed, ecs)
     state.seed = seed
     state.gems_found = 0
     state.bridges = {}
@@ -201,67 +201,56 @@ function world.init(seed)
     local cx1, cy1 = find_nearby_land(7, -2)
     local cx2, cy2 = find_nearby_land(-6, 5)
 
-    local entities = {
-        { id = "player", x = 0, y = 0, tile = "@", player = true },
-        { id = "crate1", x = 2, y = 0, tile = "B" },
-        { id = "crate2", x = 0, y = 2, tile = "B" },
-        { id = "crate3", x = -2, y = 1, tile = "B" },
-        { id = "gem1", x = -1, y = -1, tile = "G" },
-        { id = "gem2", x = gx2, y = gy2, tile = "G" },
-        { id = "gem3", x = gx3, y = gy3, tile = "G" },
-        { id = "gem4", x = gx4, y = gy4, tile = "G" },
-        { id = "gem5", x = gx5, y = gy5, tile = "G" },
-        { id = "crab1", x = cx1, y = cy1, tile = "C" },
-        { id = "crab2", x = cx2, y = cy2, tile = "C" },
-    }
+    ecs:spawn({ name = "player", pos = { x = 0, y = 0 }, sprite = { tile = "@", layer = 10 }, player = true, solid = true })
+    ecs:spawn({ name = "crate1", pos = { x = 2, y = 0 }, sprite = { tile = "B", layer = 4 }, solid = true, crate = true })
+    ecs:spawn({ name = "crate2", pos = { x = 0, y = 2 }, sprite = { tile = "B", layer = 4 }, solid = true, crate = true })
+    ecs:spawn({ name = "crate3", pos = { x = -2, y = 1 }, sprite = { tile = "B", layer = 4 }, solid = true, crate = true })
+    ecs:spawn({ name = "gem1", pos = { x = -1, y = -1 }, sprite = { tile = "G", layer = 2 }, gem = true })
+    ecs:spawn({ name = "gem2", pos = { x = gx2, y = gy2 }, sprite = { tile = "G", layer = 2 }, gem = true })
+    ecs:spawn({ name = "gem3", pos = { x = gx3, y = gy3 }, sprite = { tile = "G", layer = 2 }, gem = true })
+    ecs:spawn({ name = "gem4", pos = { x = gx4, y = gy4 }, sprite = { tile = "G", layer = 2 }, gem = true })
+    ecs:spawn({ name = "gem5", pos = { x = gx5, y = gy5 }, sprite = { tile = "G", layer = 2 }, gem = true })
+    ecs:spawn({ name = "crab1", pos = { x = cx1, y = cy1 }, sprite = { tile = "C", layer = 6 }, solid = true, crab = true })
+    ecs:spawn({ name = "crab2", pos = { x = cx2, y = cy2 }, sprite = { tile = "C", layer = 6 }, solid = true, crab = true })
 
-    local hud = {
+    return {
         status = format_status(),
         msg = "Push [] crates into water to build == bridges. Gather all Sun Gems <>!",
     }
-    return entities, hud
 end
 
 --- Advances player actions, crate bridging physics, gem pickups, and Reef Crab patrols.
 ---@param t integer Current one-based simulation step counter.
 ---@param requests table[] Player action requests queued for this step.
----@param entities table<string, table> Read-only entity snapshot keyed by identifier.
----@return table[] patches Incremental position, spawn, or removal updates for the host.
+---@param ecs any Scoped host entity-component world handle.
 ---@return table hud Optional status and message updates rendered in the HUD.
-function world.step(t, requests, entities)
-    local patches = {}
+function world.step(t, requests, ecs)
     local msg = nil
 
-    -- Track pending coordinates locally so crab AI reacts to the player's latest move.
-    local pos_x = {}
-    local pos_y = {}
-    local removed = {}
-    for id, ent in pairs(entities) do
-        pos_x[id] = ent.x
-        pos_y[id] = ent.y
-    end
-
-    local function live_at(tx, ty, skip_id)
-        for id, ent in pairs(entities) do
-            if id ~= skip_id and not removed[id] and pos_x[id] == tx and pos_y[id] == ty then
-                return ent
+    local function blocker_at(tx, ty, skip_id)
+        local first = nil
+        for _, eid in ipairs(ecs:at(tx, ty)) do
+            if eid ~= skip_id then
+                if ecs:has(eid, "solid") then
+                    return eid
+                end
+                first = first or eid
             end
         end
-        return nil
+        return first
     end
 
     for _, req in ipairs(requests) do
-        if req.action == "move" and (req.dx ~= 0 or req.dy ~= 0) then
-            local px = pos_x[req.id] or req.x
-            local py = pos_y[req.id] or req.y
+        if req.action == "move" and (req.dx ~= 0 or req.dy ~= 0) and type(req.id) == "number" and ecs:alive(req.id) then
+            local cur = ecs:get(req.id, "pos")
+            local px = cur and cur.x or req.x
+            local py = cur and cur.y or req.y
             local nx, ny = px + req.dx, py + req.dy
-            local blocker = live_at(nx, ny, req.id)
+            local blocker = blocker_at(nx, ny, req.id)
 
-            if blocker and blocker.tile == "G" then
-                removed[blocker.id] = true
-                patches[#patches + 1] = { id = blocker.id, remove = true }
-                pos_x[req.id], pos_y[req.id] = nx, ny
-                patches[#patches + 1] = { id = req.id, x = nx, y = ny }
+            if blocker and ecs:has(blocker, "gem") then
+                ecs:despawn(blocker)
+                ecs:set(req.id, "pos", { x = nx, y = ny })
                 state.gems_found = state.gems_found + 1
                 if state.gems_found >= GEMS_GOAL and not state.won then
                     state.won = true
@@ -269,28 +258,23 @@ function world.step(t, requests, entities)
                 else
                     msg = "Found a Sun Gem! " .. tostring(state.gems_found) .. "/" .. tostring(GEMS_GOAL)
                 end
-            elseif blocker and blocker.tile == "C" then
-                pos_x[req.id], pos_y[req.id] = 0, 0
-                patches[#patches + 1] = { id = req.id, x = 0, y = 0 }
+            elseif blocker and ecs:has(blocker, "crab") then
+                ecs:set(req.id, "pos", { x = 0, y = 0 })
                 msg = "Pinched by a Reef Crab! Retreated to Tidekeep camp."
-            elseif blocker and blocker.tile == "B" then
+            elseif blocker and ecs:has(blocker, "crate") then
                 local bx, by = nx + req.dx, ny + req.dy
-                local behind_ent = live_at(bx, by, blocker.id)
+                local behind_ent = blocker_at(bx, by, blocker)
                 local behind_tile = terrain_at(bx, by)
                 if behind_ent then
                     msg = "Blocked! Something sits behind that crate."
                 elseif is_water(behind_tile) then
-                    removed[blocker.id] = true
+                    ecs:despawn(blocker)
                     state.bridges[coord_key(bx, by)] = true
-                    patches[#patches + 1] = { id = blocker.id, remove = true }
-                    pos_x[req.id], pos_y[req.id] = nx, ny
-                    patches[#patches + 1] = { id = req.id, x = nx, y = ny }
+                    ecs:set(req.id, "pos", { x = nx, y = ny })
                     msg = "Splash! Driftwood crate formed a bridge."
                 elseif is_walkable(behind_tile) then
-                    pos_x[blocker.id], pos_y[blocker.id] = bx, by
-                    pos_x[req.id], pos_y[req.id] = nx, ny
-                    patches[#patches + 1] = { id = blocker.id, x = bx, y = by }
-                    patches[#patches + 1] = { id = req.id, x = nx, y = ny }
+                    ecs:set(blocker, "pos", { x = bx, y = by })
+                    ecs:set(req.id, "pos", { x = nx, y = ny })
                     msg = "Shoved driftwood crate."
                 else
                     msg = "Stone wall stops the crate."
@@ -298,8 +282,7 @@ function world.step(t, requests, entities)
             elseif not blocker then
                 local dest_tile = terrain_at(nx, ny)
                 if is_walkable(dest_tile) then
-                    pos_x[req.id], pos_y[req.id] = nx, ny
-                    patches[#patches + 1] = { id = req.id, x = nx, y = ny }
+                    ecs:set(req.id, "pos", { x = nx, y = ny })
                 elseif is_water(dest_tile) then
                     msg = "Deep tide blocks you. Push a [] crate into water to bridge!"
                 else
@@ -313,12 +296,15 @@ function world.step(t, requests, entities)
 
     -- Move Reef Crabs on their configured beat, chasing nearby explorers or patrolling shore.
     if CRAB_PERIOD > 0 and (t % CRAB_PERIOD == 0) then
-        local target_x = pos_x["player"] or 0
-        local target_y = pos_y["player"] or 0
+        local player_id = ecs:find_by_name("player")
+        local player_pos = player_id and ecs:get(player_id, "pos") or nil
+        local target_x = player_pos and player_pos.x or 0
+        local target_y = player_pos and player_pos.y or 0
 
-        for id, ent in pairs(entities) do
-            if ent.tile == "C" and not removed[id] then
-                local cx, cy = pos_x[id], pos_y[id]
+        for _, crab_id in ipairs(ecs:query("pos", "crab")) do
+            local cpos = ecs:get(crab_id, "pos")
+            if cpos then
+                local cx, cy = cpos.x, cpos.y
                 local dx_to = target_x - cx
                 local dy_to = target_y - cy
                 local dist = math.abs(dx_to) + math.abs(dy_to)
@@ -342,15 +328,13 @@ function world.step(t, requests, entities)
 
                 for _, step_dir in ipairs(cand) do
                     local nx, ny = cx + step_dir[1], cy + step_dir[2]
-                    local hit = live_at(nx, ny, id)
-                    if hit and hit.id == "player" then
-                        pos_x["player"], pos_y["player"] = 0, 0
-                        patches[#patches + 1] = { id = "player", x = 0, y = 0 }
+                    local hit = blocker_at(nx, ny, crab_id)
+                    if hit and player_id and hit == player_id then
+                        ecs:set(player_id, "pos", { x = 0, y = 0 })
                         msg = "A Reef Crab ambushed you! Back to camp."
                         break
                     elseif not hit and is_walkable(terrain_at(nx, ny)) then
-                        pos_x[id], pos_y[id] = nx, ny
-                        patches[#patches + 1] = { id = id, x = nx, y = ny }
+                        ecs:set(crab_id, "pos", { x = nx, y = ny })
                         break
                     end
                 end
@@ -358,7 +342,7 @@ function world.step(t, requests, entities)
         end
     end
 
-    return patches, { status = format_status(), msg = msg }
+    return { status = format_status(), msg = msg }
 end
 
 --- Builds the visible row-major tile array covering inclusive world bounds.

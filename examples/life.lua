@@ -70,9 +70,9 @@ end
 
 --- Seeds a glider squadron and small pseudorandom soup around the origin.
 ---@param seed integer Deterministic random seed passed by the host engine.
----@return table[] entities Empty entity list since cellular automata use terrain only.
+---@param _ecs any Unused entity world handle since cellular automata use terrain only.
 ---@return table hud Initial live cell count and control hint.
-function world.init(seed)
+function world.init(seed, _ecs)
     alive = {}
     live_count = 0
 
@@ -103,7 +103,7 @@ function world.init(seed)
         end
     end
 
-    return {}, {
+    return {
         status = "CELLS " .. tostring(live_count),
         msg = "WASD/Arrows pan viewport; E toggles center cell; P pauses.",
     }
@@ -112,10 +112,9 @@ end
 --- Advances one Conway generation or toggles the center cell on act requests.
 ---@param _t integer Current one-based simulation step counter.
 ---@param requests table[] Optional cursor toggle intents emitted when pressing act.
----@param _entities table<string, table> Unused entity map for playerless automata.
----@return table[] patches Always empty since automata state lives inside the cell set.
+---@param _ecs any Unused entity world handle for playerless automata.
 ---@return table hud Updated cell count and optional toggle confirmation message.
-function world.step(_t, requests, _entities)
+function world.step(_t, requests, _ecs)
     local msg = nil
     for _, req in ipairs(requests) do
         if req.action == "act" then
@@ -127,7 +126,7 @@ function world.step(_t, requests, _entities)
             else
                 msg = "Cleared cell (" .. tostring(req.x) .. "," .. tostring(req.y) .. ")"
             end
-            return {}, { status = "CELLS " .. tostring(live_count), msg = msg }
+            return { status = "CELLS " .. tostring(live_count), msg = msg }
         end
     end
 
@@ -161,7 +160,7 @@ function world.step(_t, requests, _entities)
     alive = next_alive
     live_count = next_count
 
-    return {}, { status = "CELLS " .. tostring(live_count), msg = msg }
+    return { status = "CELLS " .. tostring(live_count), msg = msg }
 end
 
 --- Returns the visible tile matrix covering the requested world bounding box.

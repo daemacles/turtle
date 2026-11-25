@@ -1,23 +1,50 @@
-//! Core world geometry, entity state, camera tracking, and input intent types.
+//! Core world geometry, layout calculation, camera tracking, and input intent types.
 //!
-//! Defines the pure Rust data model shared across the Lua host, terminal input layer, frame
-//! renderer, and main simulation loop without depending on terminal system calls or the Lua
-//! virtual machine. Keeping entity ownership here creates a clean boundary for evolving the store
-//! into an entity component architecture later.
+//! Defines the pure-Rust data model shared across the entity world, Lua host, terminal input layer,
+//! frame renderer, and simulation loop without depending on terminal system calls or the Lua VM.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use terminal_graphics::Colour;
 
-/// Number of logical tile rows visible inside the world viewport.
-pub const VIEWPORT_ROWS: usize = 17;
+use crate::ecs::EntityId;
 
-/// Number of logical tile columns visible when each tile occupies one terminal column.
-pub const VIEWPORT_COLS_ONE: usize = 75;
+/// Default character columns of the rendered frame when terminal dimensions are unavailable.
+pub const DEFAULT_FRAME_WIDTH: u32 = 78;
 
-/// Number of logical tile columns visible when each tile occupies two terminal columns.
-pub const VIEWPORT_COLS_TWO: usize = 37;
+/// Default character rows of the rendered frame when terminal dimensions are unavailable.
+pub const DEFAULT_FRAME_HEIGHT: u32 = 23;
+
+/// Number of logical tile rows visible in the default viewport height.
+pub const DEFAULT_VIEWPORT_ROWS: usize = 17;
+
+/// Number of logical tile columns visible at single-column tile width in the default viewport.
+pub const DEFAULT_VIEWPORT_COLS_ONE: usize = 75;
+
+/// Number of logical tile columns visible at two-column tile width in the default viewport.
+pub const DEFAULT_VIEWPORT_COLS_TWO: usize = 37;
+
+/// Minimum terminal columns required to render a playable map viewport without layout collapse.
+pub const MIN_TERMINAL_COLS: u16 = 52;
+
+/// Minimum terminal rows required to render a playable map viewport and status footer.
+pub const MIN_TERMINAL_ROWS: u16 = 14;
+
+/// Upper bound on terminal frame width so huge panes do not request excessive Lua grid rows.
+pub const MAX_FRAME_WIDTH: u16 = 160;
+
+/// Upper bound on terminal frame height so huge panes do not request excessive Lua grid rows.
+pub const MAX_FRAME_HEIGHT: u16 = 55;
+
+/// Minimum terminal columns required to dock the inspector drawer beside the map viewport.
+pub const INSPECTOR_DRAWER_MIN_COLS: u16 = 106;
+
+/// Character width reserved for the side-by-side entity inspector drawer when docked.
+pub const INSPECTOR_DRAWER_WIDTH: usize = 32;
+
+/// Number of terminal rows occupied by frame borders, divider, event log, and controls legend.
+pub const CHROME_ROWS: usize = 6;
 
 /// Minimum milliseconds between repeated movement steps in the same direction.
 pub const SAME_DIR_REPEAT_MS: u64 = 80;
@@ -156,12 +183,135 @@ pub enum CellWidth {
 }
 
 impl CellWidth {
-    /// Returns the logical viewport column count that fits inside the fixed frame width.
-    pub const fn viewport_cols(self) -> usize {
+    /// Returns the terminal column multiplier per logical world tile.
+    pub const fn columns(self) -> usize {
         match self {
-            Self::One => VIEWPORT_COLS_ONE,
-            Self::Two => VIEWPORT_COLS_TWO,
+            Self::One => 1,
+            Self::Two => 2,
         }
+    }
+
+    /// Returns the default viewport column count used when no terminal window size is present.
+    pub const fn default_viewport_cols(self) -> usize {
+        match self {
+            Self::One => DEFAULT_VIEWPORT_COLS_ONE,
+            Self::Two => DEFAULT_VIEWPORT_COLS_TWO,
+        }
+    }
+}
+
+/// Computed screen and logical viewport geometry derived from terminal dimensions and inspector mode.
+///
+/// Ensures both viewport tile counts remain odd so camera bounds stay symmetric around the center
+/// coordinate while reserving margin columns and rows to prevent terminal line-wrap scrolling.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FrameLayout {
+    /// Total character columns allocated to the display buffer.
+    pub frame_width: u32,
+    /// Total character rows allocated to the display buffer.
+    pub frame_height: u32,
+    /// Logical world tile columns requested from the world view hook.
+    pub viewport_cols: usize,
+    /// Logical world tile rows requested from the world view hook.
+    pub viewport_rows: usize,
+    /// Width of the docked side-by-side inspector panel, or zero when closed or modal.
+    pub inspector_drawer_width: usize,
+}
+
+impl FrameLayout {
+    /// Computes frame and viewport geometry for optional terminal dimensions and inspector state.
+    ///
+    /// Falls back to standard default dimensions when no terminal dimensions are supplied. Returns
+    /// an error holding the undersized dimensions when the terminal is too small to draw cleanly.
+    ///
+    /// - `term_size`: detected terminal columns and rows, or none for non-terminal execution.
+    /// - `cell_width`: terminal columns occupied by each logical tile.
+    /// - `inspector_open`: whether the entity inspector is currently toggled visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reported column and row pair when the terminal pane is smaller than the minimum
+    /// playable size.
+    pub fn compute(
+        term_size: Option<(u16, u16)>,
+        cell_width: CellWidth,
+        inspector_open: bool,
+    ) -> Result<Self, (u16, u16)> {
+        let Some((cols, rows)) = term_size else {
+            return Ok(Self::default_for(cell_width));
+        };
+
+        if cols < MIN_TERMINAL_COLS || rows < MIN_TERMINAL_ROWS {
+            return Err((cols, rows));
+        }
+
+        // Leave one spare terminal column and bottom row so edge writes never auto-wrap or scroll.
+        let avail_cols = (cols.saturating_sub(1)).min(MAX_FRAME_WIDTH) as usize;
+        let avail_rows = (rows.saturating_sub(1)).min(MAX_FRAME_HEIGHT) as usize;
+
+        let inspector_drawer_width = if inspector_open && cols >= INSPECTOR_DRAWER_MIN_COLS {
+            INSPECTOR_DRAWER_WIDTH
+        } else {
+            0
+        };
+
+        let raw_rows = avail_rows.saturating_sub(CHROME_ROWS).max(1);
+        let viewport_rows = force_odd_at_least_one(raw_rows);
+
+        let map_budget = avail_cols.saturating_sub(inspector_drawer_width);
+        let tile_cols_budget = map_budget.saturating_sub(4) / cell_width.columns();
+        let viewport_cols = force_odd_at_least_one(tile_cols_budget.max(1));
+
+        let map_width = viewport_cols * cell_width.columns() + 4;
+        let frame_width = (map_width + inspector_drawer_width) as u32;
+        let frame_height = (viewport_rows + CHROME_ROWS) as u32;
+
+        Ok(Self {
+            frame_width,
+            frame_height,
+            viewport_cols,
+            viewport_rows,
+            inspector_drawer_width,
+        })
+    }
+
+    /// Returns the fallback layout matching a standard eighty-by-twenty-four terminal window.
+    ///
+    /// - `cell_width`: terminal columns occupied by each logical tile.
+    pub const fn default_for(cell_width: CellWidth) -> Self {
+        let viewport_cols = cell_width.default_viewport_cols();
+        let frame_width = match cell_width {
+            CellWidth::One => (viewport_cols + 4) as u32,
+            CellWidth::Two => DEFAULT_FRAME_WIDTH,
+        };
+        Self {
+            frame_width,
+            frame_height: DEFAULT_FRAME_HEIGHT,
+            viewport_cols,
+            viewport_rows: DEFAULT_VIEWPORT_ROWS,
+            inspector_drawer_width: 0,
+        }
+    }
+
+    /// Returns the total character columns belonging to the map panel including its borders.
+    pub const fn map_width(&self) -> usize {
+        self.frame_width as usize - self.inspector_drawer_width
+    }
+
+    /// Returns the usable inner text columns inside the map panel borders.
+    pub const fn map_inner_width(&self) -> usize {
+        self.map_width().saturating_sub(4)
+    }
+}
+
+/// Rounds an even count down by one so viewport extents remain odd and camera-centered.
+const fn force_odd_at_least_one(n: usize) -> usize {
+    if n <= 1 {
+        1
+    } else if n.is_multiple_of(2) {
+        n - 1
+    } else {
+        n
     }
 }
 
@@ -232,17 +382,26 @@ pub enum Action {
     Act,
 }
 
-/// Per-entity intent submitted by the host into the Lua world step function.
+/// Identifies whether an input intent applies to a live entity or the virtual camera reticle.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IntentTarget {
+    /// Action targeting a specific generational entity handle.
+    Entity(EntityId),
+    /// Action targeting the center reticle in a playerless world.
+    Cursor,
+}
+
+/// Per-entity or cursor intent submitted by the host into the Lua world step function.
 ///
 /// Separating intents from entity storage lets both local keyboard actions and future network or
 /// mouse commands feed one uniform request queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
-    /// Identifier of the entity or virtual cursor issuing the action.
-    pub entity_id: String,
+    /// Target entity handle or virtual cursor receiving the action.
+    pub target: IntentTarget,
     /// Action requested for this step.
     pub action: Action,
-    /// Entity world position captured at the time the intent was built.
+    /// World position captured at the time the intent was built.
     pub origin: Coord,
 }
 
@@ -309,122 +468,6 @@ impl RepeatCadence {
         }
         self.last_move = Some((dir, now));
         true
-    }
-}
-
-/// Authoritative Rust-owned record for one live actor or object in the world.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entity {
-    /// Unique identifier shared between Rust storage and Lua scripts.
-    pub id: String,
-    /// Current world coordinates.
-    pub pos: Coord,
-    /// Key into the loaded world palette used to draw this entity.
-    pub tile: String,
-    /// Whether this entity receives local player input and camera tracking.
-    pub is_player: bool,
-}
-
-/// Incremental mutation returned by Lua to update, spawn, or remove an entity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntityPatch {
-    /// Target entity identifier to update, insert, or remove.
-    pub id: String,
-    /// Replacement world position when moving or spawning an entity.
-    pub pos: Option<Coord>,
-    /// Replacement palette key when changing appearance.
-    pub tile: Option<String>,
-    /// Replacement player flag when changing camera or input ownership.
-    pub is_player: Option<bool>,
-    /// Marks the matching entity for removal from the entity store.
-    pub remove: bool,
-}
-
-/// Ordered registry of all active world entities owned by Rust.
-///
-/// Preserves insertion order so entity overlay compositing remains deterministic across frames and
-/// prepares cleanly for component-based storage in later versions.
-#[derive(Clone, Debug, Default)]
-pub struct EntityStore {
-    /// Live entities ordered by creation time.
-    entities: Vec<Entity>,
-}
-
-impl EntityStore {
-    /// Builds a store from an initial entity list, promoting the default player identifier when unmarked.
-    ///
-    /// Duplicate identifiers collapse by updating the earlier entry in place so insertion order
-    /// stays deterministic.
-    ///
-    /// - `list`: initial entities emitted by the script's initialization hook.
-    pub fn from_entities(list: Vec<Entity>) -> Self {
-        let mut store = Self::default();
-        for entity in list {
-            if let Some(existing) = store.entities.iter_mut().find(|e| e.id == entity.id) {
-                *existing = entity;
-            } else {
-                store.entities.push(entity);
-            }
-        }
-
-        if !store.entities.iter().any(|e| e.is_player)
-            && let Some(player) = store.entities.iter_mut().find(|e| e.id == "player")
-        {
-            player.is_player = true;
-        }
-
-        store
-    }
-
-    /// Applies a batch of Lua-produced entity mutations in order.
-    ///
-    /// Removals filter out matching identifiers, updates patch existing records in place, and
-    /// unseen identifiers with a position insert as new entities.
-    ///
-    /// - `patches`: delta updates emitted by one simulation step.
-    pub fn apply_patches(&mut self, patches: &[EntityPatch]) {
-        for patch in patches {
-            if patch.remove {
-                self.entities.retain(|e| e.id != patch.id);
-                continue;
-            }
-
-            if let Some(existing) = self.entities.iter_mut().find(|e| e.id == patch.id) {
-                if let Some(pos) = patch.pos {
-                    existing.pos = pos;
-                }
-                if let Some(tile) = &patch.tile {
-                    existing.tile = tile.clone();
-                }
-                if let Some(is_player) = patch.is_player {
-                    existing.is_player = is_player;
-                }
-            } else if let Some(pos) = patch.pos {
-                let is_player = patch.is_player.unwrap_or_else(|| patch.id == "player");
-                let tile = patch.tile.clone().unwrap_or_else(|| "?".to_string());
-                self.entities.push(Entity {
-                    id: patch.id.clone(),
-                    pos,
-                    tile,
-                    is_player,
-                });
-            }
-        }
-    }
-
-    /// Returns the active player entity if one exists in the store.
-    pub fn player(&self) -> Option<&Entity> {
-        self.entities.iter().find(|e| e.is_player)
-    }
-
-    /// Iterates over all live entities in deterministic insertion order.
-    pub fn iter(&self) -> std::slice::Iter<'_, Entity> {
-        self.entities.iter()
-    }
-
-    /// Returns the total number of live entities currently stored.
-    pub fn len(&self) -> usize {
-        self.entities.len()
     }
 }
 
@@ -565,7 +608,7 @@ impl MessageLog {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests verifying camera deadzones, entity registry patches, cadence limiting, and tile styles.
+    //! Unit tests verifying camera deadzones, frame layouts, cadence limiting, and tile styles.
 
     use super::*;
 
@@ -574,12 +617,12 @@ mod tests {
         let cam = Camera {
             center: Coord::new(0, 0),
         };
-        let b2 = cam.bounds(VIEWPORT_COLS_TWO, VIEWPORT_ROWS);
+        let b2 = cam.bounds(DEFAULT_VIEWPORT_COLS_TWO, DEFAULT_VIEWPORT_ROWS);
         assert_eq!(b2.min, Coord::new(-18, -8));
         assert_eq!(b2.max, Coord::new(18, 8));
         assert_eq!((b2.width(), b2.height()), (37, 17));
 
-        let b1 = cam.bounds(VIEWPORT_COLS_ONE, VIEWPORT_ROWS);
+        let b1 = cam.bounds(DEFAULT_VIEWPORT_COLS_ONE, DEFAULT_VIEWPORT_ROWS);
         assert_eq!(b1.min, Coord::new(-37, -8));
         assert_eq!(b1.max, Coord::new(37, 8));
         assert_eq!((b1.width(), b1.height()), (75, 17));
@@ -589,11 +632,19 @@ mod tests {
     fn camera_deadzone_holds_inside_inner_box_and_tracks_overshoot() {
         let mut cam = Camera::default();
         // Inside 37x17 deadzone (|dx| <= 9, |dy| <= 4) camera stays still.
-        cam.follow_deadzone(Coord::new(9, -4), VIEWPORT_COLS_TWO, VIEWPORT_ROWS);
+        cam.follow_deadzone(
+            Coord::new(9, -4),
+            DEFAULT_VIEWPORT_COLS_TWO,
+            DEFAULT_VIEWPORT_ROWS,
+        );
         assert_eq!(cam.center, Coord::new(0, 0));
 
         // Stepping one cell past east and south boundaries shifts camera by 1 on each axis.
-        cam.follow_deadzone(Coord::new(10, 5), VIEWPORT_COLS_TWO, VIEWPORT_ROWS);
+        cam.follow_deadzone(
+            Coord::new(10, 5),
+            DEFAULT_VIEWPORT_COLS_TWO,
+            DEFAULT_VIEWPORT_ROWS,
+        );
         assert_eq!(cam.center, Coord::new(1, 1));
 
         cam.pan(-3, 2);
@@ -601,53 +652,36 @@ mod tests {
     }
 
     #[test]
-    fn entity_store_promotes_player_and_applies_move_spawn_remove_patches() {
-        let mut store = EntityStore::from_entities(vec![
-            Entity {
-                id: "crate1".into(),
-                pos: Coord::new(2, 0),
-                tile: "B".into(),
-                is_player: false,
-            },
-            Entity {
-                id: "player".into(),
-                pos: Coord::new(0, 0),
-                tile: "@".into(),
-                is_player: false,
-            },
-        ]);
+    fn frame_layout_adapts_odd_viewports_and_inspector_drawer_threshold() {
+        let std_two = FrameLayout::compute(Some((80, 24)), CellWidth::Two, true).unwrap();
+        assert_eq!(std_two.frame_width, DEFAULT_FRAME_WIDTH);
+        assert_eq!(std_two.frame_height, DEFAULT_FRAME_HEIGHT);
+        assert_eq!((std_two.viewport_cols, std_two.viewport_rows), (37, 17));
+        assert_eq!(std_two.inspector_drawer_width, 0);
 
-        assert_eq!(store.player().unwrap().id, "player");
-        assert_eq!(store.len(), 2);
+        let std_one = FrameLayout::compute(Some((80, 24)), CellWidth::One, false).unwrap();
+        assert_eq!((std_one.viewport_cols, std_one.viewport_rows), (75, 17));
+        assert_eq!(std_one.frame_width, 79);
 
-        store.apply_patches(&[
-            EntityPatch {
-                id: "player".into(),
-                pos: Some(Coord::new(1, 0)),
-                tile: None,
-                is_player: None,
-                remove: false,
-            },
-            EntityPatch {
-                id: "crate1".into(),
-                pos: None,
-                tile: None,
-                is_player: None,
-                remove: true,
-            },
-            EntityPatch {
-                id: "gem1".into(),
-                pos: Some(Coord::new(4, -2)),
-                tile: Some("G".into()),
-                is_player: None,
-                remove: false,
-            },
-        ]);
+        let wide_closed = FrameLayout::compute(Some((120, 34)), CellWidth::Two, false).unwrap();
+        assert_eq!(wide_closed.inspector_drawer_width, 0);
+        assert_eq!(wide_closed.viewport_cols % 2, 1);
+        assert_eq!(wide_closed.viewport_rows % 2, 1);
+        assert_eq!(wide_closed.viewport_rows, 27);
 
-        assert_eq!(store.len(), 2);
-        assert_eq!(store.player().unwrap().pos, Coord::new(1, 0));
-        let ids: Vec<&str> = store.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, vec!["player", "gem1"]);
+        let wide_open = FrameLayout::compute(Some((120, 34)), CellWidth::Two, true).unwrap();
+        assert_eq!(wide_open.inspector_drawer_width, INSPECTOR_DRAWER_WIDTH);
+        assert!(wide_open.frame_width <= 119);
+        assert_eq!(wide_open.viewport_cols % 2, 1);
+
+        assert_eq!(
+            FrameLayout::compute(Some((51, 24)), CellWidth::Two, false),
+            Err((51, 24))
+        );
+        assert_eq!(
+            FrameLayout::compute(Some((80, 13)), CellWidth::Two, false),
+            Err((80, 13))
+        );
     }
 
     #[test]

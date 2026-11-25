@@ -1,21 +1,34 @@
-//! Non-blocking raw terminal input guard, ANSI sequence decoder, and window size queries.
+//! Non-blocking raw terminal input guard, ANSI sequence decoder, resize handler, and frame output.
 //!
 //! Configures standard input on interactive POSIX terminals so single keypresses arrive without
 //! waiting for newline characters or echoing over the rendered grid, while leaving output
-//! post-processing enabled so frame redraws preserve line alignment. Installs drop and panic hooks
-//! to restore terminal attributes and cursor visibility on any exit path.
+//! post-processing enabled so frame redraws preserve line alignment. Enters the alternate screen
+//! buffer on interactive terminals, tracks window-resize signals asynchronously, wraps TTY updates
+//! in synchronized output markers, and restores terminal state on drop or panic.
 
 use std::io::{self, IsTerminal, Write};
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
+
+use terminal_graphics::Display;
 
 use crate::model::Action;
 
 /// Saved original terminal attributes used by the panic hook to restore shell state on crash.
 static SAVED_TERMIOS: OnceLock<Mutex<Option<libc::termios>>> = OnceLock::new();
 
+/// Tracks whether the alternate screen buffer is active so cleanup leaves normal scrollback intact.
+static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Flag set by the window-change signal handler when the terminal size changes.
+static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Ensures the terminal-restoring panic hook is registered at most once per process.
 static PANIC_HOOK_ONCE: Once = Once::new();
+
+/// Ensures the window-resize signal handler is registered at most once per process.
+static SIGWINCH_ONCE: Once = Once::new();
 
 /// Decoded keyboard or control event read from standard input.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -30,7 +43,13 @@ pub enum RawInput {
     ResetSameSeed,
     /// Reset simulation time to zero with a freshly generated random seed.
     ResetNewSeed,
-    /// Dismiss any non-fatal overlay such as an inline error box.
+    /// Toggle visibility of the live entity-component inspector view.
+    ToggleInspector,
+    /// Move selection backward to the previous entity in the inspector list.
+    InspectorPrev,
+    /// Move selection forward to the next entity in the inspector list.
+    InspectorNext,
+    /// Dismiss any non-fatal overlay such as an inline error box or inspector modal.
     DismissOverlay,
     /// Exit the application cleanly.
     Quit,
@@ -39,24 +58,24 @@ pub enum RawInput {
 /// RAII guard that enables raw keyboard input on interactive terminals and restores state on drop.
 ///
 /// Leaving non-interactive standard input streams untouched allows piped smoke tests and unit test
-/// runners to execute without terminal ioctl failures. Restores saved attributes and cursor
-/// visibility deterministically when dropped on the main thread.
+/// runners to execute without terminal ioctl failures. Enters the alternate screen buffer and hides
+/// the cursor on interactive terminals, restoring saved attributes deterministically on drop.
 pub struct TerminalGuard {
     /// Original terminal configuration captured before enabling raw mode, if attached to a TTY.
     orig: Option<libc::termios>,
 }
 
 impl TerminalGuard {
-    /// Switches an interactive terminal into non-canonical no-echo input mode and hides the cursor.
+    /// Switches an interactive terminal into raw input mode inside the alternate screen buffer.
     ///
     /// When standard input or standard output is not a terminal, succeeds without modifying file
-    /// descriptor attributes. Registers a process panic hook the first time raw mode is entered so
-    /// unexpected panics still restore normal shell input and cursor visibility.
+    /// descriptor attributes or writing terminal mode escapes. Registers process panic and resize
+    /// handlers the first time raw mode is entered.
     ///
     /// # Errors
     ///
     /// Returns any operating-system error reported while reading or updating terminal attributes or
-    /// writing the cursor-hide escape sequence.
+    /// writing the alternate-screen and cursor-hide escape sequences.
     pub fn enter() -> io::Result<Self> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(Self { orig: None });
@@ -73,6 +92,7 @@ impl TerminalGuard {
         let orig = unsafe { orig.assume_init() };
 
         install_panic_restore_hook();
+        install_sigwinch_handler();
         store_saved_termios(Some(orig));
 
         let mut raw = orig;
@@ -92,13 +112,27 @@ impl TerminalGuard {
             return Err(io::Error::last_os_error());
         }
 
-        {
+        let enter_res = {
             let mut stdout = io::stdout().lock();
-            stdout.write_all(b"\x1b[?25l")?;
-            stdout.flush()?;
+            stdout.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+            stdout.flush()
+        };
+        if let Err(err) = enter_res {
+            // SAFETY: `orig` holds valid kernel-provided `termios` attributes for `STDIN_FILENO`.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig);
+            }
+            store_saved_termios(None);
+            return Err(err);
         }
 
+        ALT_SCREEN_ACTIVE.store(true, Ordering::Release);
         Ok(Self { orig: Some(orig) })
+    }
+
+    /// Reports whether standard input and output are connected to an interactive terminal.
+    pub fn is_interactive_tty(&self) -> bool {
+        self.orig.is_some()
     }
 }
 
@@ -110,8 +144,13 @@ impl Drop for TerminalGuard {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig);
             }
             store_saved_termios(None);
+            let leave_alt = ALT_SCREEN_ACTIVE.swap(false, Ordering::AcqRel);
             let mut stdout = io::stdout().lock();
-            let _ = stdout.write_all(b"\x1b[?25h\x1b[0m");
+            if leave_alt {
+                let _ = stdout.write_all(b"\x1b[?25h\x1b[0m\x1b[?1049l");
+            } else {
+                let _ = stdout.write_all(b"\x1b[?25h\x1b[0m");
+            }
             let _ = stdout.flush();
         }
     }
@@ -138,7 +177,11 @@ fn install_panic_restore_hook() {
                 unsafe {
                     libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &orig);
                 }
-                let seq = b"\x1b[?25h\x1b[0m\r\n";
+                let seq: &[u8] = if ALT_SCREEN_ACTIVE.swap(false, Ordering::AcqRel) {
+                    b"\x1b[?25h\x1b[0m\x1b[?1049l\r\n"
+                } else {
+                    b"\x1b[?25h\x1b[0m\r\n"
+                };
                 // SAFETY: `seq` points to valid static bytes written synchronously to stdout.
                 unsafe {
                     libc::write(
@@ -151,6 +194,65 @@ fn install_panic_restore_hook() {
             prev(info);
         }));
     });
+}
+
+/// Async-signal-safe handler marking a pending window resize when the terminal changes size.
+extern "C" fn handle_sigwinch(_sig: libc::c_int) {
+    RESIZE_PENDING.store(true, Ordering::Relaxed);
+}
+
+/// Installs the window-resize signal handler without restart flags so poll wakes immediately.
+fn install_sigwinch_handler() {
+    SIGWINCH_ONCE.call_once(|| {
+        // SAFETY: `libc::sigaction` is a C POD struct whose zeroed representation is valid prior
+        // to initializing `sa_sigaction`, `sa_mask`, and `sa_flags`.
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = handle_sigwinch as *const () as libc::sighandler_t;
+        sa.sa_flags = 0;
+        // SAFETY: `sa.sa_mask` points to aligned writable storage sized for `sigset_t`.
+        unsafe {
+            libc::sigemptyset(&mut sa.sa_mask);
+            // SAFETY: `handle_sigwinch` only performs an atomic store and `SIGWINCH` registration
+            // uses a properly initialized `sigaction` struct.
+            libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+/// Returns and clears whether a terminal resize signal arrived since the last check.
+pub fn take_resize_pending() -> bool {
+    RESIZE_PENDING.swap(false, Ordering::AcqRel)
+}
+
+/// Flushes a composed frame to standard output using synchronized framing on interactive TTYs.
+///
+/// Interactive mode positions the cursor below the display height so cursor-up rendering overwrites
+/// from the top row cleanly inside the alternate screen buffer, wrapping updates in synchronized
+/// output markers to eliminate flicker. Non-terminal invocations fall back to direct printing.
+///
+/// - `display`: composed character grid ready for output.
+/// - `is_tty`: whether standard output is running inside the interactive alternate screen.
+/// - `clear_screen`: true after layout changes so stale cells outside the new frame are erased.
+///
+/// # Errors
+///
+/// Returns any standard output write or flush error reported by the operating system.
+pub fn present_frame(display: &Display, is_tty: bool, clear_screen: bool) -> io::Result<()> {
+    if !is_tty {
+        return display.print();
+    }
+
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    lock.write_all(b"\x1b[?2026h")?;
+    if clear_screen {
+        lock.write_all(b"\x1b[2J")?;
+    }
+    let anchor_row = display.height().saturating_add(1);
+    write!(lock, "\x1b[{anchor_row};1H")?;
+    display.write_to(&mut lock)?;
+    lock.write_all(b"\x1b[?2026l")?;
+    lock.flush()
 }
 
 /// Queries the current terminal dimensions in columns and rows if attached to a terminal.
@@ -363,6 +465,9 @@ fn map_single_byte(b: u8) -> Option<RawInput> {
         b'n' | b'N' => Some(RawInput::StepOnce),
         b'r' => Some(RawInput::ResetSameSeed),
         b'R' => Some(RawInput::ResetNewSeed),
+        b'\t' | b'i' | b'I' => Some(RawInput::ToggleInspector),
+        b'[' => Some(RawInput::InspectorPrev),
+        b']' => Some(RawInput::InspectorNext),
         b' ' | b'.' => Some(RawInput::Action(Action::Wait)),
         b'e' | b'E' | b'\r' | b'\n' => Some(RawInput::Action(Action::Act)),
         b'w' | b'W' | b'k' | b'K' => Some(RawInput::Action(Action::Move { dx: 0, dy: -1 })),
@@ -375,13 +480,13 @@ fn map_single_byte(b: u8) -> Option<RawInput> {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests verifying ASCII keybindings, ANSI arrow decoding, and unknown CSI suppression.
+    //! Unit tests verifying ASCII keybindings, ANSI arrow decoding, and inspector shortcuts.
 
     use super::*;
 
     #[test]
-    fn parses_movement_wait_act_and_engine_keys() {
-        let bytes = b"wAsD hJkL .\r\nepNrRq\x03";
+    fn parses_movement_wait_act_inspector_and_engine_keys() {
+        let bytes = b"wAsD hJkL .\r\nepNrR\tiI[]q\x03";
         assert_eq!(
             parse_input_bytes(bytes),
             vec![
@@ -403,6 +508,11 @@ mod tests {
                 RawInput::StepOnce,
                 RawInput::ResetSameSeed,
                 RawInput::ResetNewSeed,
+                RawInput::ToggleInspector,
+                RawInput::ToggleInspector,
+                RawInput::ToggleInspector,
+                RawInput::InspectorPrev,
+                RawInput::InspectorNext,
                 RawInput::Quit,
                 RawInput::Quit,
             ]

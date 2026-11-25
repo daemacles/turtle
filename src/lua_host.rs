@@ -1,12 +1,12 @@
-//! Sandboxed Lua script loader, ABI marshaler, and atomic hot-reload file watcher.
+//! Sandboxed Lua script loader, scoped ECS userdata bridge, and atomic hot-reload watcher.
 //!
-//! Instantiates isolated Lua virtual machines for world scripts, converts between Rust world
-//! structs and Lua tables, captures Lua print calls into an off-screen buffer, and swaps virtual
+//! Instantiates isolated Lua virtual machines for world scripts, registers the host entity world
+//! userdata interface, captures Lua print calls into an off-screen buffer, and swaps virtual
 //! machines atomically on reload so script errors freeze the previous valid world instead of
 //! crashing or corrupting terminal output.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -15,13 +15,17 @@ use std::time::{Duration, Instant, SystemTime};
 use mlua::prelude::*;
 use terminal_graphics::Colour;
 
+use crate::ecs::{EcsWorld, EntityId, ScriptValue, Sprite};
 use crate::model::{
-    CellWidth, Coord, DEFAULT_IDLE_MS, Entity, EntityPatch, EntityStore, HudUpdate, Intent, Pacing,
-    RectBounds, TileStyle, WorldConfig,
+    CellWidth, Coord, DEFAULT_IDLE_MS, HudUpdate, Intent, IntentTarget, Pacing, RectBounds,
+    TileStyle, WorldConfig,
 };
 
 /// Minimum interval between file metadata checks when polling for script edits.
 const WATCH_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Maximum nested table depth accepted when marshaling dynamic Lua components into Rust.
+const MAX_SCRIPT_DEPTH: usize = 16;
 
 /// Loaded Lua virtual machine bound to one validated world script table.
 ///
@@ -65,7 +69,8 @@ impl LuaWorld {
 
     /// Compiles and validates an in-memory Lua world script inside a fresh virtual machine.
     ///
-    /// Evaluates the source chunk, resolves the exported world table, and validates required hooks.
+    /// Evaluates the source chunk, registers host userdata types, resolves the exported world
+    /// table, and validates required hooks.
     ///
     /// - `source`: complete Lua chunk text defining the world.
     /// - `chunk_name`: diagnostic chunk name shown in Lua syntax and runtime stack traces.
@@ -81,6 +86,7 @@ impl LuaWorld {
         default_title: &str,
     ) -> LuaResult<Self> {
         let lua = Lua::new();
+        lua.register_userdata_type::<EcsWorld>(register_ecs_methods)?;
         let print_buf = Rc::new(RefCell::new(Vec::new()));
         install_print_capture(&lua, Rc::clone(&print_buf))?;
 
@@ -125,78 +131,77 @@ impl LuaWorld {
         &self.palette
     }
 
-    /// Seeds Lua's random generator and invokes the script's optional initialization hook.
+    /// Seeds Lua's random generator and populates a fresh entity world via the init hook.
     ///
-    /// Returns the starting entity list, initial status and message update, and any lines printed
-    /// during startup.
+    /// Passes a scoped mutable handle to the script's initialization function so Lua cannot retain
+    /// a dangling reference after initialization returns.
     ///
     /// - `seed`: deterministic integer seed passed to `math.randomseed` and `init`.
     ///
     /// # Errors
     ///
-    /// Returns a [LuaError] if seeding Lua fails, if `init` raises an error, or if any returned
-    /// entity record lacks required coordinates or palette keys.
-    pub fn init(&self, seed: u64) -> LuaResult<(Vec<Entity>, HudUpdate, Vec<String>)> {
+    /// Returns a [LuaError] if seeding Lua fails, if `init` raises an error, or if any spawned
+    /// entity component fails validation.
+    pub fn init(&self, seed: u64) -> LuaResult<(EcsWorld, HudUpdate, Vec<String>)> {
         self.print_buf.borrow_mut().clear();
         seed_lua_rng(&self.lua, seed)?;
 
         let world_tbl: LuaTable = self.lua.registry_value(&self.world_key)?;
         let maybe_init: Option<LuaFunction> = world_tbl.get("init")?;
+        let mut ecs = EcsWorld::new();
         let Some(init_fn) = maybe_init else {
             let printed = std::mem::take(&mut *self.print_buf.borrow_mut());
-            return Ok((Vec::new(), HudUpdate::default(), printed));
+            return Ok((ecs, HudUpdate::default(), printed));
         };
 
-        let results = init_fn.call::<LuaMultiValue>(seed as i64)?;
-        let mut iter = results.into_iter();
-        let entities = match iter.next() {
-            Some(LuaValue::Table(tbl)) => parse_initial_entities(&tbl)?,
-            Some(LuaValue::Nil) | None => Vec::new(),
-            Some(_) => {
+        let hud_val = self.lua.scope(|scope| {
+            let ecs_ud = scope.create_any_userdata_ref_mut(&mut ecs)?;
+            init_fn.call::<LuaValue>((seed as i64, ecs_ud))
+        })?;
+
+        let hud = match hud_val {
+            LuaValue::Table(tbl) => parse_hud(&tbl)?,
+            LuaValue::Nil => HudUpdate::default(),
+            _ => {
                 return Err(LuaError::external(
-                    "world.init first return value must be an entity array or nil",
-                ));
-            }
-        };
-        let hud = match iter.next() {
-            Some(LuaValue::Table(tbl)) => parse_hud(&tbl)?,
-            Some(LuaValue::Nil) | None => HudUpdate::default(),
-            Some(_) => {
-                return Err(LuaError::external(
-                    "world.init second return value must be a hud table or nil",
+                    "world.init return value must be a hud table or nil",
                 ));
             }
         };
 
         let printed = std::mem::take(&mut *self.print_buf.borrow_mut());
-        Ok((entities, hud, printed))
+        Ok((ecs, hud, printed))
     }
 
-    /// Advances world logic by one step with player intents and an entity snapshot.
+    /// Advances world logic by one step against a transactional copy of the entity world.
     ///
-    /// Marshals intents and the entity snapshot into Lua, invokes the step hook, and parses patches.
+    /// Clones the live entity world before entering the scoped script call so any Lua runtime error
+    /// drops the half-mutated working copy and preserves the caller's previous state untouched.
     ///
     /// - `t`: target simulation step counter starting at one after initialization.
     /// - `intents`: external player or cursor actions queued for this step.
-    /// - `store`: authoritative entity snapshot read by Lua for collision and AI decisions.
+    /// - `current_ecs`: authoritative entity world snapshot before this step runs.
     ///
     /// # Errors
     ///
-    /// Returns a [LuaError] if calling `step` raises a script error or returns malformed entity
-    /// patch entries.
+    /// Returns a [LuaError] if calling `step` raises a script error, supplies malformed component
+    /// updates, or returns a non-table HUD value.
     pub fn step(
         &self,
         t: u64,
         intents: &[Intent],
-        store: &EntityStore,
-    ) -> LuaResult<(Vec<EntityPatch>, HudUpdate, Vec<String>)> {
+        current_ecs: &EcsWorld,
+    ) -> LuaResult<(EcsWorld, HudUpdate, Vec<String>)> {
         self.print_buf.borrow_mut().clear();
 
         let requests_tbl = self.lua.create_table_with_capacity(intents.len(), 0)?;
         for (idx, intent) in intents.iter().enumerate() {
             let (dx, dy) = intent.delta();
             let req = self.lua.create_table_with_capacity(0, 6)?;
-            req.set("id", intent.entity_id.as_str())?;
+            match intent.target {
+                IntentTarget::Entity(id) => req.set("id", id.to_lua_int())?,
+                IntentTarget::Cursor => req.set("id", "$cursor")?,
+            }
             req.set("action", intent.action_name())?;
             req.set("x", intent.origin.x)?;
             req.set("y", intent.origin.y)?;
@@ -205,43 +210,27 @@ impl LuaWorld {
             requests_tbl.raw_set(idx + 1, req)?;
         }
 
-        let entities_tbl = self.lua.create_table_with_capacity(0, store.len())?;
-        for entity in store.iter() {
-            let entry = self.lua.create_table_with_capacity(0, 5)?;
-            entry.set("id", entity.id.as_str())?;
-            entry.set("x", entity.pos.x)?;
-            entry.set("y", entity.pos.y)?;
-            entry.set("tile", entity.tile.as_str())?;
-            entry.set("player", entity.is_player)?;
-            entities_tbl.set(entity.id.as_str(), entry)?;
-        }
-
+        let mut working_ecs = current_ecs.clone();
         let world_tbl: LuaTable = self.lua.registry_value(&self.world_key)?;
         let step_fn: LuaFunction = world_tbl.get("step")?;
-        let results = step_fn.call::<LuaMultiValue>((t as i64, requests_tbl, entities_tbl))?;
 
-        let mut iter = results.into_iter();
-        let patches = match iter.next() {
-            Some(LuaValue::Table(tbl)) => parse_entity_patches(&tbl)?,
-            Some(LuaValue::Nil) | None => Vec::new(),
-            Some(_) => {
+        let hud_val = self.lua.scope(|scope| {
+            let ecs_ud = scope.create_any_userdata_ref_mut(&mut working_ecs)?;
+            step_fn.call::<LuaValue>((t as i64, requests_tbl, ecs_ud))
+        })?;
+
+        let hud = match hud_val {
+            LuaValue::Table(tbl) => parse_hud(&tbl)?,
+            LuaValue::Nil => HudUpdate::default(),
+            _ => {
                 return Err(LuaError::external(
-                    "world.step first return value must be an update array or nil",
-                ));
-            }
-        };
-        let hud = match iter.next() {
-            Some(LuaValue::Table(tbl)) => parse_hud(&tbl)?,
-            Some(LuaValue::Nil) | None => HudUpdate::default(),
-            Some(_) => {
-                return Err(LuaError::external(
-                    "world.step second return value must be a hud table or nil",
+                    "world.step return value must be a hud table or nil",
                 ));
             }
         };
 
         let printed = std::mem::take(&mut *self.print_buf.borrow_mut());
-        Ok((patches, hud, printed))
+        Ok((working_ecs, hud, printed))
     }
 
     /// Queries Lua for the visible tile rows covering the inclusive bounding box.
@@ -348,6 +337,330 @@ impl LuaWorld {
             _ => Err(LuaError::external(format!(
                 "cell at viewport ({rx}, {ry}) must be a palette key string or style table"
             ))),
+        }
+    }
+}
+
+/// Registers the host entity-component methods exposed to Lua on scoped userdata handles.
+fn register_ecs_methods(reg: &mut LuaUserDataRegistry<EcsWorld>) {
+    reg.add_method_mut("spawn", |_, ecs, components: Option<LuaTable>| {
+        let id = ecs.spawn();
+        if let Some(tbl) = components {
+            for pair in tbl.pairs::<String, LuaValue>() {
+                let (key, val) = match pair {
+                    Ok(kv) => kv,
+                    Err(err) => {
+                        ecs.despawn(id);
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = set_entity_component(ecs, id, &key, val) {
+                    ecs.despawn(id);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(id.to_lua_int())
+    });
+
+    reg.add_method_mut("despawn", |_, ecs, raw_id: i64| {
+        let Some(id) = EntityId::from_lua_int(raw_id) else {
+            return Ok(false);
+        };
+        Ok(ecs.despawn(id))
+    });
+
+    reg.add_method("alive", |_, ecs, raw_id: i64| {
+        Ok(EntityId::from_lua_int(raw_id).is_some_and(|id| ecs.is_alive(id)))
+    });
+
+    reg.add_method("get", |lua, ecs, (raw_id, name): (i64, String)| {
+        let Some(id) = EntityId::from_lua_int(raw_id).filter(|&id| ecs.is_alive(id)) else {
+            return Ok(LuaValue::Nil);
+        };
+        get_entity_component(lua, ecs, id, &name)
+    });
+
+    reg.add_method_mut(
+        "set",
+        |_, ecs, (raw_id, name, val): (i64, String, LuaValue)| {
+            let id = require_live_entity(ecs, raw_id)?;
+            set_entity_component(ecs, id, &name, val)
+        },
+    );
+
+    reg.add_method_mut("remove", |_, ecs, (raw_id, name): (i64, String)| {
+        let Some(id) = EntityId::from_lua_int(raw_id).filter(|&id| ecs.is_alive(id)) else {
+            return Ok(false);
+        };
+        Ok(ecs.remove_component(id, &name))
+    });
+
+    reg.add_method("has", |_, ecs, (raw_id, name): (i64, String)| {
+        let Some(id) = EntityId::from_lua_int(raw_id).filter(|&id| ecs.is_alive(id)) else {
+            return Ok(false);
+        };
+        Ok(ecs.has_component(id, &name))
+    });
+
+    reg.add_method("query", |lua, ecs, names: LuaVariadic<String>| {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ids = ecs.query(&refs);
+        pack_entity_ids(lua, &ids)
+    });
+
+    reg.add_method("at", |lua, ecs, (x, y): (i32, i32)| {
+        let ids = ecs.at(Coord::new(x, y));
+        pack_entity_ids(lua, &ids)
+    });
+
+    reg.add_method("find_by_name", |_, ecs, name: String| {
+        Ok(ecs.find_by_name(&name).map(EntityId::to_lua_int))
+    });
+
+    reg.add_method("count", |_, ecs, ()| Ok(ecs.len() as i64));
+}
+
+/// Validates that a Lua integer decodes to a currently live entity handle.
+fn require_live_entity(ecs: &EcsWorld, raw_id: i64) -> LuaResult<EntityId> {
+    let id = EntityId::from_lua_int(raw_id)
+        .ok_or_else(|| LuaError::external(format!("invalid entity handle {raw_id}")))?;
+    if !ecs.is_alive(id) {
+        return Err(LuaError::external(format!(
+            "stale or dead entity handle {id}"
+        )));
+    }
+    Ok(id)
+}
+
+/// Packs a slice of Rust entity handles into a one-based Lua array table.
+fn pack_entity_ids(lua: &Lua, ids: &[EntityId]) -> LuaResult<LuaTable> {
+    let tbl = lua.create_table_with_capacity(ids.len(), 0)?;
+    for (idx, id) in ids.iter().enumerate() {
+        tbl.raw_set(idx + 1, id.to_lua_int())?;
+    }
+    Ok(tbl)
+}
+
+/// Reads one core or custom component from a live entity and marshals it to Lua.
+fn get_entity_component(
+    lua: &Lua,
+    ecs: &EcsWorld,
+    id: EntityId,
+    name: &str,
+) -> LuaResult<LuaValue> {
+    match name {
+        "pos" => {
+            let Some(pos) = ecs.position(id) else {
+                return Ok(LuaValue::Nil);
+            };
+            let tbl = lua.create_table_with_capacity(0, 2)?;
+            tbl.set("x", pos.x)?;
+            tbl.set("y", pos.y)?;
+            Ok(LuaValue::Table(tbl))
+        }
+        "sprite" => {
+            let Some(sprite) = ecs.sprite(id) else {
+                return Ok(LuaValue::Nil);
+            };
+            let tbl = lua.create_table_with_capacity(0, 2)?;
+            tbl.set("tile", sprite.tile.as_str())?;
+            tbl.set("layer", sprite.layer)?;
+            Ok(LuaValue::Table(tbl))
+        }
+        "name" => match ecs.name(id) {
+            Some(label) => Ok(LuaValue::String(lua.create_string(label)?)),
+            None => Ok(LuaValue::Nil),
+        },
+        "player" => Ok(if ecs.is_player(id) {
+            LuaValue::Boolean(true)
+        } else {
+            LuaValue::Nil
+        }),
+        "solid" => Ok(if ecs.is_solid(id) {
+            LuaValue::Boolean(true)
+        } else {
+            LuaValue::Nil
+        }),
+        other => match ecs.custom(id, other) {
+            Some(val) => script_value_to_lua(lua, val),
+            None => Ok(LuaValue::Nil),
+        },
+    }
+}
+
+/// Writes or detaches one core or custom component on a live entity.
+fn set_entity_component(
+    ecs: &mut EcsWorld,
+    id: EntityId,
+    name: &str,
+    val: LuaValue,
+) -> LuaResult<()> {
+    if matches!(val, LuaValue::Nil) {
+        ecs.remove_component(id, name);
+        return Ok(());
+    }
+
+    match name {
+        "pos" => {
+            let LuaValue::Table(tbl) = val else {
+                return Err(LuaError::external(
+                    "component 'pos' must be a table { x = integer, y = integer }",
+                ));
+            };
+            let x: i32 = tbl.get("x")?;
+            let y: i32 = tbl.get("y")?;
+            ecs.set_position(id, Coord::new(x, y));
+            Ok(())
+        }
+        "sprite" => {
+            let sprite = match val {
+                LuaValue::String(s) => Sprite {
+                    tile: s.to_str()?.to_string(),
+                    layer: 0,
+                },
+                LuaValue::Table(tbl) => {
+                    let tile = tbl
+                        .get::<Option<String>>("tile")?
+                        .or(tbl.get::<Option<String>>(1)?)
+                        .ok_or_else(|| {
+                            LuaError::external(
+                                "component 'sprite' table must specify 'tile' or index 1",
+                            )
+                        })?;
+                    let layer = tbl.get::<Option<i32>>("layer")?.unwrap_or(0);
+                    Sprite { tile, layer }
+                }
+                _ => {
+                    return Err(LuaError::external(
+                        "component 'sprite' must be a palette key string or { tile, layer? } table",
+                    ));
+                }
+            };
+            ecs.set_sprite(id, sprite);
+            Ok(())
+        }
+        "name" => {
+            let LuaValue::String(s) = val else {
+                return Err(LuaError::external("component 'name' must be a string"));
+            };
+            ecs.set_name(id, s.to_str()?.as_ref());
+            Ok(())
+        }
+        "player" => {
+            let LuaValue::Boolean(flag) = val else {
+                return Err(LuaError::external("component 'player' must be a boolean"));
+            };
+            ecs.set_player(id, flag);
+            Ok(())
+        }
+        "solid" => {
+            let LuaValue::Boolean(flag) = val else {
+                return Err(LuaError::external("component 'solid' must be a boolean"));
+            };
+            ecs.set_solid(id, flag);
+            Ok(())
+        }
+        other => {
+            let script_val = lua_to_script_value(val, 0)?;
+            ecs.set_custom(id, other, script_val);
+            Ok(())
+        }
+    }
+}
+
+/// Converts a dynamic Lua value into a pure-Rust value tree with bounded recursion depth.
+fn lua_to_script_value(val: LuaValue, depth: usize) -> LuaResult<ScriptValue> {
+    if depth > MAX_SCRIPT_DEPTH {
+        return Err(LuaError::external(format!(
+            "component value exceeds maximum nesting depth of {MAX_SCRIPT_DEPTH}"
+        )));
+    }
+    match val {
+        LuaValue::Boolean(b) => Ok(ScriptValue::Bool(b)),
+        LuaValue::Integer(n) => Ok(ScriptValue::Int(n)),
+        LuaValue::Number(f) => Ok(ScriptValue::Float(f)),
+        LuaValue::String(s) => Ok(ScriptValue::Str(s.to_str()?.to_string())),
+        LuaValue::Table(tbl) => {
+            let mut entries = Vec::new();
+            for pair in tbl.pairs::<LuaValue, LuaValue>() {
+                entries.push(pair?);
+            }
+            if entries.is_empty() {
+                return Ok(ScriptValue::Table(BTreeMap::new()));
+            }
+
+            let mut list_items: Vec<(i64, ScriptValue)> = Vec::with_capacity(entries.len());
+            let mut is_dense_array = true;
+            for (k, _) in &entries {
+                if let LuaValue::Integer(idx) = k
+                    && *idx >= 1
+                {
+                    continue;
+                }
+                is_dense_array = false;
+                break;
+            }
+
+            if is_dense_array {
+                for (k, v) in &entries {
+                    if let LuaValue::Integer(idx) = k {
+                        list_items.push((*idx, lua_to_script_value(v.clone(), depth + 1)?));
+                    }
+                }
+                list_items.sort_by_key(|(idx, _)| *idx);
+                let contiguous = list_items
+                    .iter()
+                    .enumerate()
+                    .all(|(pos, (idx, _))| *idx == (pos as i64) + 1);
+                if contiguous {
+                    return Ok(ScriptValue::List(
+                        list_items.into_iter().map(|(_, v)| v).collect(),
+                    ));
+                }
+            }
+
+            let mut map = BTreeMap::new();
+            for (k, v) in entries {
+                let key_str = match k {
+                    LuaValue::String(s) => s.to_str()?.to_string(),
+                    LuaValue::Integer(i) => i.to_string(),
+                    _ => {
+                        return Err(LuaError::external(
+                            "custom component table keys must be strings or integers",
+                        ));
+                    }
+                };
+                map.insert(key_str, lua_to_script_value(v, depth + 1)?);
+            }
+            Ok(ScriptValue::Table(map))
+        }
+        _ => Err(LuaError::external(
+            "custom component values may only contain booleans, numbers, strings, or plain tables",
+        )),
+    }
+}
+
+/// Converts a stored script value tree back into a Lua value inside the active interpreter.
+fn script_value_to_lua(lua: &Lua, val: &ScriptValue) -> LuaResult<LuaValue> {
+    match val {
+        ScriptValue::Bool(b) => Ok(LuaValue::Boolean(*b)),
+        ScriptValue::Int(n) => Ok(LuaValue::Integer(*n)),
+        ScriptValue::Float(f) => Ok(LuaValue::Number(*f)),
+        ScriptValue::Str(s) => Ok(LuaValue::String(lua.create_string(s)?)),
+        ScriptValue::List(items) => {
+            let tbl = lua.create_table_with_capacity(items.len(), 0)?;
+            for (idx, item) in items.iter().enumerate() {
+                tbl.raw_set(idx + 1, script_value_to_lua(lua, item)?)?;
+            }
+            Ok(LuaValue::Table(tbl))
+        }
+        ScriptValue::Table(map) => {
+            let tbl = lua.create_table_with_capacity(0, map.len())?;
+            for (k, v) in map {
+                tbl.set(k.as_str(), script_value_to_lua(lua, v)?)?;
+            }
+            Ok(LuaValue::Table(tbl))
         }
     }
 }
@@ -557,66 +870,7 @@ fn parse_colour(name: &str) -> LuaResult<Colour> {
     })
 }
 
-/// Parses the initial entity sequence returned by script initialization.
-fn parse_initial_entities(tbl: &LuaTable) -> LuaResult<Vec<Entity>> {
-    let mut entities = Vec::new();
-    for val in tbl.sequence_values::<LuaValue>() {
-        let LuaValue::Table(entry) = val? else {
-            return Err(LuaError::external(
-                "each entry returned by world.init must be a table",
-            ));
-        };
-        let id: String = entry.get("id")?;
-        let x: i32 = entry.get("x")?;
-        let y: i32 = entry.get("y")?;
-        let tile: String = entry.get("tile")?;
-        let is_player = entry.get::<Option<bool>>("player")?.unwrap_or(false);
-        entities.push(Entity {
-            id,
-            pos: Coord::new(x, y),
-            tile,
-            is_player,
-        });
-    }
-    Ok(entities)
-}
-
-/// Parses the delta update sequence returned by a simulation step.
-fn parse_entity_patches(tbl: &LuaTable) -> LuaResult<Vec<EntityPatch>> {
-    let mut patches = Vec::new();
-    for val in tbl.sequence_values::<LuaValue>() {
-        let LuaValue::Table(entry) = val? else {
-            return Err(LuaError::external(
-                "each entry returned by world.step must be an update table",
-            ));
-        };
-        let id: String = entry.get("id")?;
-        let remove = entry.get::<Option<bool>>("remove")?.unwrap_or(false);
-        let x: Option<i32> = entry.get("x")?;
-        let y: Option<i32> = entry.get("y")?;
-        let pos = match (x, y) {
-            (Some(px), Some(py)) => Some(Coord::new(px, py)),
-            (None, None) => None,
-            _ => {
-                return Err(LuaError::external(format!(
-                    "update for entity '{id}' must specify both x and y when moving or spawning"
-                )));
-            }
-        };
-        let tile: Option<String> = entry.get("tile")?;
-        let is_player: Option<bool> = entry.get("player")?;
-        patches.push(EntityPatch {
-            id,
-            pos,
-            tile,
-            is_player,
-            remove,
-        });
-    }
-    Ok(patches)
-}
-
-/// Parses optional status and event strings from the second return value.
+/// Parses optional status and event strings from the HUD update table.
 fn parse_hud(tbl: &LuaTable) -> LuaResult<HudUpdate> {
     Ok(HudUpdate {
         status: tbl.get("status")?,
@@ -626,61 +880,113 @@ fn parse_hud(tbl: &LuaTable) -> LuaResult<HudUpdate> {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests covering script loading, entity patching, view queries, and shadow reload isolation.
+    //! Unit tests covering script loading, scoped ECS userdata, rollback, and shadow reload.
 
     use super::*;
-    use crate::model::{Action, Camera, VIEWPORT_ROWS};
+    use crate::model::{
+        Action, Camera, DEFAULT_VIEWPORT_COLS_TWO, DEFAULT_VIEWPORT_ROWS,
+    };
 
     #[test]
     fn loads_world_tidekeep_and_steps_into_viewport() {
         let world = LuaWorld::load_from_path(Path::new("world.lua")).unwrap();
-        let (init_entities, hud, _) = world.init(42).unwrap();
-        assert!(!init_entities.is_empty());
+        let (mut ecs, hud, _) = world.init(42).unwrap();
+        assert!(!ecs.is_empty());
         assert!(hud.status.is_some());
 
-        let mut store = EntityStore::from_entities(init_entities);
-        let player = store.player().unwrap().clone();
+        let (player_id, player_pos) = ecs.player().unwrap();
         let intents = vec![Intent {
-            entity_id: player.id,
+            target: IntentTarget::Entity(player_id),
             action: Action::Move { dx: 1, dy: 0 },
-            origin: player.pos,
+            origin: player_pos,
         }];
-        let (patches, _, _) = world.step(1, &intents, &store).unwrap();
-        store.apply_patches(&patches);
+        let (next_ecs, _, _) = world.step(1, &intents, &ecs).unwrap();
+        ecs = next_ecs;
 
         let mut cam = Camera::default();
-        cam.snap_to(store.player().unwrap().pos);
-        let bounds = cam.bounds(world.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+        let (_, moved_pos) = ecs.player().unwrap();
+        cam.snap_to(moved_pos);
+        let bounds = cam.bounds(
+            world.config().cell_width.default_viewport_cols(),
+            DEFAULT_VIEWPORT_ROWS,
+        );
         let (grid, _) = world.view(bounds, 1).unwrap();
-        assert_eq!(grid.len(), VIEWPORT_ROWS);
-        assert_eq!(grid[0].len(), world.config().cell_width.viewport_cols());
+        assert_eq!(grid.len(), DEFAULT_VIEWPORT_ROWS);
+        assert_eq!(grid[0].len(), DEFAULT_VIEWPORT_COLS_TWO);
     }
 
     #[test]
     fn loads_and_steps_life_and_simple_room_examples() {
         for path in ["examples/life.lua", "examples/simple_room.lua"] {
             let world = LuaWorld::load_from_path(Path::new(path)).unwrap();
-            let (entities, _, _) = world.init(42).unwrap();
-            let mut store = EntityStore::from_entities(entities);
-            let (patches, _, _) = world.step(1, &[], &store).unwrap();
-            store.apply_patches(&patches);
+            let (ecs, _, _) = world.init(42).unwrap();
+            let (next_ecs, _, _) = world.step(1, &[], &ecs).unwrap();
             let cam = Camera::default();
-            let bounds = cam.bounds(world.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+            let bounds = cam.bounds(
+                world.config().cell_width.default_viewport_cols(),
+                DEFAULT_VIEWPORT_ROWS,
+            );
             let (grid, _) = world.view(bounds, 1).unwrap();
-            assert_eq!(grid.len(), VIEWPORT_ROWS);
+            assert_eq!(grid.len(), DEFAULT_VIEWPORT_ROWS);
+            assert!(next_ecs.len() <= ecs.len() + 1);
         }
+    }
+
+    #[test]
+    fn step_rolls_back_mutations_on_runtime_error_and_rejects_escaped_handles() {
+        let script = r#"
+            local world = {
+                palette = { ["."] = { " .", "White", "Black" } },
+            }
+            local leaked = nil
+            function world.init(_seed, ecs)
+                ecs:spawn({ name = "hero", pos = { x = 0, y = 0 }, sprite = "@", player = true })
+            end
+            function world.step(t, _req, ecs)
+                if t == 1 then
+                    leaked = ecs
+                    local hero = ecs:find_by_name("hero")
+                    ecs:set(hero, "pos", { x = 99, y = 99 })
+                    error("boom mid-step")
+                end
+                return { status = tostring(leaked:count()) }
+            end
+            function world.view(start_pos, end_pos, _t)
+                local rows = {}
+                for y = start_pos.y, end_pos.y do
+                    local row = {}
+                    for x = start_pos.x, end_pos.x do
+                        row[#row + 1] = "."
+                    end
+                    rows[#rows + 1] = row
+                end
+                return rows
+            end
+            return world
+        "#;
+
+        let world = LuaWorld::load_from_source(script, "=rollback_test", "test").unwrap();
+        let (ecs, _, _) = world.init(1).unwrap();
+        let hero = ecs.find_by_name("hero").unwrap();
+        assert_eq!(ecs.position(hero), Some(Coord::new(0, 0)));
+
+        // Step 1 mutates hero then errors: caller snapshot must remain untouched.
+        assert!(world.step(1, &[], &ecs).is_err());
+        assert_eq!(ecs.position(hero), Some(Coord::new(0, 0)));
+
+        // Step 2 tries to call the leaked userdata handle captured in step 1: must fail safely.
+        assert!(world.step(2, &[], &ecs).is_err());
     }
 
     #[test]
     fn shadow_reload_rejects_broken_script_without_disturbing_active_world() {
         let active = LuaWorld::load_from_path(Path::new("examples/simple_room.lua")).unwrap();
-        let (entities, _, _) = active.init(7).unwrap();
-        let store = EntityStore::from_entities(entities);
+        let (ecs, _, _) = active.init(7).unwrap();
 
         let broken = LuaWorld::load_from_source("local world = { broken = ", "=broken", "broken");
         assert!(broken.is_err());
 
-        let (patches, _, _) = active.step(1, &[], &store).unwrap();
-        assert!(patches.len() <= store.len() + 1);
+        let (next_ecs, _, _) = active.step(1, &[], &ecs).unwrap();
+        assert_eq!(next_ecs.len(), ecs.len());
     }
 }

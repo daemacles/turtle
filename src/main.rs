@@ -1,10 +1,12 @@
 //! Interactive terminal game and simulation engine driven by hot-reloaded Lua world scripts.
 //!
-//! Launches a fixed-size character-grid viewport around an embedded Lua world controller, polls
-//! raw keyboard input without blocking timed updates, manages authoritative entity storage, and
-//! atomically reloads modified scripts back to time zero without losing terminal stability on
-//! mid-edit syntax errors.
+//! Launches a dynamically sized character-grid viewport around an embedded Lua world controller
+//! backed by a hand-rolled entity-component store, polls raw keyboard input without blocking timed
+//! updates, presents frames inside an alternate screen buffer with live resize and entity
+//! inspection, and atomically reloads modified scripts back to time zero without losing terminal
+//! stability on mid-edit syntax errors.
 
+mod ecs;
 mod lua_host;
 mod model;
 mod render;
@@ -18,11 +20,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mlua::prelude::*;
 use terminal_graphics::{Colour, Display};
 
+use crate::ecs::EcsWorld;
 use crate::lua_host::{FileStampWatcher, LuaWorld};
 use crate::model::{
-    Action, Camera, CellWidth, EntityStore, Intent, MessageLog, Pacing, RepeatCadence, TileStyle, VIEWPORT_ROWS,
+    Action, Camera, CellWidth, DEFAULT_FRAME_WIDTH, FrameLayout, Intent, IntentTarget, MessageLog,
+    Pacing, RepeatCadence, TileStyle,
 };
-use crate::render::{FRAME_HEIGHT, FRAME_WIDTH, FrameState};
+use crate::render::FrameState;
 use crate::tty::{RawInput, TerminalGuard};
 
 /// Duration that the outer border stays highlighted green after a successful hot-reload.
@@ -49,8 +53,8 @@ struct EngineState {
     last_declared_seed: Option<u64>,
     /// Metadata watcher detecting editor saves to the world script.
     watcher: FileStampWatcher,
-    /// Authoritative entity store shared across simulation steps and rendering.
-    store: EntityStore,
+    /// Authoritative entity-component store shared across simulation steps, rendering, and inspection.
+    ecs: EcsWorld,
     /// Viewport camera following the player deadzone or manual panning.
     camera: Camera,
     /// Key-repeat throttle protecting exploration movement from terminal repeat floods.
@@ -73,24 +77,32 @@ struct EngineState {
     pending_tick_intent: Option<Intent>,
     /// Latest terrain rows returned by the active world script for the current camera bounds.
     terrain: Vec<Vec<TileStyle>>,
+    /// Active screen and viewport geometry derived from terminal dimensions and inspector state.
+    layout: FrameLayout,
+    /// Whether the live entity-component inspector view is currently displayed.
+    inspector_open: bool,
+    /// Zero-based index into live entities currently highlighted by the inspector.
+    inspector_selected: usize,
     /// Non-fatal script error shown inside an overlay while keeping the last valid state frozen.
     error_overlay: Option<String>,
-    /// Last terminal dimensions seen when smaller than the required canvas, for redraw detection.
+    /// Last terminal dimensions seen when smaller than the playable minimum, for redraw detection.
     last_too_small: Option<(u16, u16)>,
+    /// Marks that the full screen must be wiped before presenting after a geometry change.
+    needs_clear: bool,
     /// Flag indicating that the frame buffer needs to be re-composed and printed.
     dirty: bool,
 }
 
 impl EngineState {
     /// Creates an initial unpopulated engine state ready to load a world script.
-    fn new(script_path: PathBuf) -> Self {
+    fn new(script_path: PathBuf, layout: FrameLayout) -> Self {
         let watcher = FileStampWatcher::new(&script_path);
         Self {
             script_path,
             world: None,
             last_declared_seed: None,
             watcher,
-            store: EntityStore::default(),
+            ecs: EcsWorld::new(),
             camera: Camera::default(),
             cadence: RepeatCadence::new(),
             log: MessageLog::default(),
@@ -101,25 +113,32 @@ impl EngineState {
             reload_flash_until: None,
             next_step_at: None,
             pending_tick_intent: None,
-            terrain: default_blank_terrain(CellWidth::Two),
+            terrain: default_blank_terrain(layout),
+            layout,
+            inspector_open: false,
+            inspector_selected: 0,
             error_overlay: None,
             last_too_small: None,
+            needs_clear: true,
             dirty: true,
         }
     }
 
     /// Compiles and initializes the script in an isolated candidate virtual machine before swapping.
     ///
-    /// Preserves the previous world, entities, and terrain intact if compilation, initialization, or
-    /// the initial viewport query fails, recording the diagnostic in `error_overlay`.
+    /// Preserves the previous world, entities, layout, and terrain intact if compilation,
+    /// initialization, or the initial viewport query fails.
     fn reload_from_disk(
         &mut self,
+        display: &mut Display,
+        is_tty: bool,
         now: Instant,
         fresh_seed: bool,
         announce_reload: bool,
     ) -> LuaResult<()> {
         let candidate = LuaWorld::load_from_path(&self.script_path)?;
         let declared = candidate.config().declared_seed;
+        let cell_width = candidate.config().cell_width;
 
         let next_seed = if fresh_seed {
             roll_random_seed()
@@ -130,22 +149,31 @@ impl EngineState {
             self.seed
         };
 
-        let (entities, hud, init_prints) = candidate.init(next_seed)?;
-        let store = EntityStore::from_entities(entities);
+        let term_size = if is_tty { tty::terminal_size() } else { None };
+        let target_layout = FrameLayout::compute(term_size, cell_width, self.inspector_open)
+            .unwrap_or_else(|_| FrameLayout::default_for(cell_width));
+
+        let (ecs, hud, init_prints) = candidate.init(next_seed)?;
         let mut camera = Camera::default();
-        if let Some(player) = store.player() {
-            camera.snap_to(player.pos);
+        if let Some((_, pos)) = ecs.player() {
+            camera.snap_to(pos);
         }
 
-        let bounds = camera.bounds(candidate.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+        let bounds = camera.bounds(target_layout.viewport_cols, target_layout.viewport_rows);
         let (terrain, view_prints) = candidate.view(bounds, 0)?;
 
         self.world = Some(candidate);
         self.last_declared_seed = declared;
         self.seed = next_seed;
-        self.store = store;
+        self.ecs = ecs;
+        self.clamp_inspector_selection();
         self.camera = camera;
         self.terrain = terrain;
+        if target_layout != self.layout {
+            self.layout = target_layout;
+            *display = Display::new(target_layout.frame_width, target_layout.frame_height);
+            self.needs_clear = true;
+        }
         self.tick = 0;
         self.paused = false;
         self.pending_tick_intent = None;
@@ -177,31 +205,37 @@ impl EngineState {
     }
 
     /// Re-initializes the currently loaded world back to step zero without recompiling from disk.
-    fn reset_loaded_world(&mut self, now: Instant, fresh_seed: bool) {
+    fn reset_loaded_world(
+        &mut self,
+        display: &mut Display,
+        is_tty: bool,
+        now: Instant,
+        fresh_seed: bool,
+    ) {
         if fresh_seed {
             self.seed = roll_random_seed();
         }
         let Some(world) = self.world.as_ref() else {
-            if let Err(err) = self.reload_from_disk(now, fresh_seed, true) {
+            if let Err(err) = self.reload_from_disk(display, is_tty, now, fresh_seed, true) {
                 self.set_error(err.to_string());
             }
             return;
         };
 
-        let init_outcome = world.init(self.seed).and_then(|(entities, hud, init_prints)| {
-            let store = EntityStore::from_entities(entities);
+        let init_outcome = world.init(self.seed).and_then(|(ecs, hud, init_prints)| {
             let mut camera = Camera::default();
-            if let Some(player) = store.player() {
-                camera.snap_to(player.pos);
+            if let Some((_, pos)) = ecs.player() {
+                camera.snap_to(pos);
             }
-            let bounds = camera.bounds(world.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+            let bounds = camera.bounds(self.layout.viewport_cols, self.layout.viewport_rows);
             let (terrain, view_prints) = world.view(bounds, 0)?;
-            Ok((store, camera, terrain, hud, init_prints, view_prints))
+            Ok((ecs, camera, terrain, hud, init_prints, view_prints))
         });
 
         match init_outcome {
-            Ok((store, camera, terrain, hud, init_prints, view_prints)) => {
-                self.store = store;
+            Ok((ecs, camera, terrain, hud, init_prints, view_prints)) => {
+                self.ecs = ecs;
+                self.clamp_inspector_selection();
                 self.camera = camera;
                 self.terrain = terrain;
                 self.tick = 0;
@@ -226,22 +260,25 @@ impl EngineState {
         }
     }
 
-    /// Executes one simulation step and refreshes terrain for the active camera.
+    /// Executes one simulation step transactionally and refreshes terrain for the active camera.
     fn execute_step(&mut self, intents: Vec<Intent>, now: Instant) -> LuaResult<()> {
         let Some(world) = self.world.as_ref() else {
             return Ok(());
         };
 
         let next_tick = self.tick.saturating_add(1);
-        let (patches, hud, step_prints) = world.step(next_tick, &intents, &self.store)?;
+        let (next_ecs, hud, step_prints) = world.step(next_tick, &intents, &self.ecs)?;
 
         self.tick = next_tick;
-        self.store.apply_patches(&patches);
+        self.ecs = next_ecs;
+        clamp_index(self.ecs.len(), &mut self.inspector_selected);
 
-        let cell_width = world.config().cell_width;
-        if let Some(player) = self.store.player() {
-            self.camera
-                .follow_deadzone(player.pos, cell_width.viewport_cols(), VIEWPORT_ROWS);
+        if let Some((_, pos)) = self.ecs.player() {
+            self.camera.follow_deadzone(
+                pos,
+                self.layout.viewport_cols,
+                self.layout.viewport_rows,
+            );
         }
 
         for line in step_prints {
@@ -256,7 +293,7 @@ impl EngineState {
 
         let bounds = self
             .camera
-            .bounds(cell_width.viewport_cols(), VIEWPORT_ROWS);
+            .bounds(self.layout.viewport_cols, self.layout.viewport_rows);
         let (terrain, view_prints) = world.view(bounds, self.tick)?;
         for line in view_prints {
             self.log.push_line(line);
@@ -270,11 +307,12 @@ impl EngineState {
     /// Refreshes terrain for the current camera without advancing simulation time.
     fn refresh_view_only(&mut self) {
         let Some(world) = self.world.as_ref() else {
+            self.terrain = default_blank_terrain(self.layout);
             return;
         };
         let bounds = self
             .camera
-            .bounds(world.config().cell_width.viewport_cols(), VIEWPORT_ROWS);
+            .bounds(self.layout.viewport_cols, self.layout.viewport_rows);
         match world.view(bounds, self.tick) {
             Ok((terrain, view_prints)) => {
                 for line in view_prints {
@@ -284,6 +322,53 @@ impl EngineState {
                 self.dirty = true;
             }
             Err(err) => self.set_error(err.to_string()),
+        }
+    }
+
+    /// Keeps the inspector selection index inside the current live entity range.
+    fn clamp_inspector_selection(&mut self) {
+        clamp_index(self.ecs.len(), &mut self.inspector_selected);
+    }
+
+    /// Recomputes display dimensions and viewport bounds when terminal size or drawer state changes.
+    fn sync_layout(&mut self, display: &mut Display, is_tty: bool) {
+        let cell_width = self
+            .world
+            .as_ref()
+            .map_or(CellWidth::Two, |w| w.config().cell_width);
+        let term_size = if is_tty { tty::terminal_size() } else { None };
+
+        match FrameLayout::compute(term_size, cell_width, self.inspector_open) {
+            Ok(new_layout) => {
+                if self.last_too_small.take().is_some() {
+                    self.needs_clear = true;
+                    self.dirty = true;
+                }
+                if new_layout != self.layout {
+                    self.layout = new_layout;
+                    *display = Display::new(new_layout.frame_width, new_layout.frame_height);
+                    self.needs_clear = true;
+                    if let Some((_, pos)) = self.ecs.player() {
+                        self.camera.follow_deadzone(
+                            pos,
+                            new_layout.viewport_cols,
+                            new_layout.viewport_rows,
+                        );
+                    }
+                    self.refresh_view_only();
+                    self.dirty = true;
+                }
+            }
+            Err((cols, rows)) => {
+                if self.last_too_small != Some((cols, rows)) {
+                    self.last_too_small = Some((cols, rows));
+                    let w = (cols.max(12) as u32).min(DEFAULT_FRAME_WIDTH);
+                    let h = rows.saturating_sub(1).clamp(5, 10) as u32;
+                    *display = Display::new(w, h);
+                    self.needs_clear = true;
+                    self.dirty = true;
+                }
+            }
         }
     }
 
@@ -328,14 +413,14 @@ impl EngineState {
         wait_ms.max(0)
     }
 
-    /// Paints the current state onto the display buffer and flushes it if dirty.
-    fn render_if_dirty(&mut self, display: &mut Display, now: Instant) -> io::Result<()> {
-        let too_small = tty::terminal_size()
-            .filter(|&(cols, rows)| cols < FRAME_WIDTH as u16 || rows < FRAME_HEIGHT as u16 + 1);
-        if too_small != self.last_too_small {
-            self.last_too_small = too_small;
-            self.dirty = true;
-        }
+    /// Syncs layout, paints the frame buffer, and flushes output when dirty.
+    fn render_if_dirty(
+        &mut self,
+        display: &mut Display,
+        is_tty: bool,
+        now: Instant,
+    ) -> io::Result<()> {
+        self.sync_layout(display, is_tty);
 
         if !self.dirty {
             return Ok(());
@@ -355,29 +440,33 @@ impl EngineState {
         let reload_flash = self.reload_flash_until.is_some_and(|end| now < end);
         let bounds = self
             .camera
-            .bounds(cell_width.viewport_cols(), VIEWPORT_ROWS);
+            .bounds(self.layout.viewport_cols, self.layout.viewport_rows);
 
         let frame = FrameState {
             title,
             pacing,
             cell_width,
+            layout: self.layout,
             tick: self.tick,
             seed: self.seed,
             paused: self.paused,
             reload_flash,
             bounds,
             terrain: &self.terrain,
-            entities: &self.store,
+            ecs: &self.ecs,
             palette,
             camera_center: self.camera.center,
             hud_status: &self.hud_status,
             log: &self.log,
+            inspector_open: self.inspector_open,
+            inspector_selected: self.inspector_selected,
             error_overlay: self.error_overlay.as_deref(),
-            terminal_too_small: too_small,
+            terminal_too_small: self.last_too_small,
         };
 
         render::compose_frame(display, &frame);
-        display.print()?;
+        let clear = std::mem::take(&mut self.needs_clear);
+        tty::present_frame(display, is_tty, clear)?;
         self.dirty = false;
         Ok(())
     }
@@ -454,7 +543,7 @@ fn dispatch_player_action(state: &mut EngineState, action: Action, now: Instant)
         return;
     }
 
-    if let Some(player) = state.store.player().cloned() {
+    if let Some((player_id, player_pos)) = state.ecs.player() {
         if let Action::Move { dx, dy } = action {
             let pacing = state
                 .world
@@ -466,9 +555,9 @@ fn dispatch_player_action(state: &mut EngineState, action: Action, now: Instant)
         }
 
         let intent = Intent {
-            entity_id: player.id,
+            target: IntentTarget::Entity(player_id),
             action,
-            origin: player.pos,
+            origin: player_pos,
         };
         let pacing = state
             .world
@@ -494,7 +583,7 @@ fn dispatch_player_action(state: &mut EngineState, action: Action, now: Instant)
         }
         Action::Act => {
             let intent = Intent {
-                entity_id: "$cursor".to_string(),
+                target: IntentTarget::Cursor,
                 action: Action::Act,
                 origin: state.camera.center,
             };
@@ -510,6 +599,15 @@ fn dispatch_player_action(state: &mut EngineState, action: Action, now: Instant)
     }
 }
 
+/// Clamps a selection cursor so it remains within the live element count.
+fn clamp_index(count: usize, selected: &mut usize) {
+    if count == 0 {
+        *selected = 0;
+    } else if *selected >= count {
+        *selected = count - 1;
+    }
+}
+
 /// Generates a compact random seed from monotonic clock nanoseconds.
 fn roll_random_seed() -> u64 {
     let nanos = SystemTime::now()
@@ -518,17 +616,17 @@ fn roll_random_seed() -> u64 {
     ((nanos ^ (nanos >> 16)) & 0xffff) as u64
 }
 
-/// Creates a blank black terrain grid matching the active tile width.
-fn default_blank_terrain(cell_width: CellWidth) -> Vec<Vec<TileStyle>> {
+/// Creates a blank black terrain grid matching the active layout dimensions.
+fn default_blank_terrain(layout: FrameLayout) -> Vec<Vec<TileStyle>> {
     let style = TileStyle::from_spec(" ", Colour::White, Some(Colour::Black));
-    vec![vec![style; cell_width.viewport_cols()]; VIEWPORT_ROWS]
+    vec![vec![style; layout.viewport_cols]; layout.viewport_rows]
 }
 
 /// Runs fixed-step non-interactive smoke frames and exits cleanly.
 fn run_smoke_steps(state: &mut EngineState, display: &mut Display, steps: u64) -> LuaResult<()> {
     let now = Instant::now();
-    state.reload_from_disk(now, false, false)?;
-    if let Err(err) = state.render_if_dirty(display, now)
+    state.reload_from_disk(display, false, now, false, false)?;
+    if let Err(err) = state.render_if_dirty(display, false, now)
         && err.kind() != ErrorKind::BrokenPipe
     {
         return Err(LuaError::external(err));
@@ -537,7 +635,7 @@ fn run_smoke_steps(state: &mut EngineState, display: &mut Display, steps: u64) -
     for _ in 0..steps {
         let step_now = Instant::now();
         state.execute_step(Vec::new(), step_now)?;
-        if let Err(err) = state.render_if_dirty(display, step_now) {
+        if let Err(err) = state.render_if_dirty(display, false, step_now) {
             if err.kind() == ErrorKind::BrokenPipe {
                 return Ok(());
             }
@@ -549,15 +647,19 @@ fn run_smoke_steps(state: &mut EngineState, display: &mut Display, steps: u64) -
 }
 
 /// Runs the interactive raw-mode event loop until the user quits or closes input.
-fn run_interactive(state: &mut EngineState, display: &mut Display) -> io::Result<()> {
+fn run_interactive(state: &mut EngineState, display: &mut Display, is_tty: bool) -> io::Result<()> {
     let start = Instant::now();
-    if let Err(err) = state.reload_from_disk(start, false, false) {
+    if let Err(err) = state.reload_from_disk(display, is_tty, start, false, false) {
         state.set_error(err.to_string());
     }
-    state.render_if_dirty(display, start)?;
+    state.render_if_dirty(display, is_tty, start)?;
 
     loop {
         let now = Instant::now();
+
+        if tty::take_resize_pending() {
+            state.dirty = true;
+        }
 
         if let Some(flash_end) = state.reload_flash_until
             && now >= flash_end
@@ -567,13 +669,17 @@ fn run_interactive(state: &mut EngineState, display: &mut Display) -> io::Result
         }
 
         if state.watcher.poll_changed(now)
-            && let Err(err) = state.reload_from_disk(now, false, true)
+            && let Err(err) = state.reload_from_disk(display, is_tty, now, false, true)
         {
             state.set_error(err.to_string());
         }
 
         let timeout_ms = state.poll_timeout_ms(now);
         let events = tty::poll_and_drain_inputs(timeout_ms)?;
+        if tty::take_resize_pending() {
+            state.dirty = true;
+        }
+
         let step_now = Instant::now();
         let (controls, player_action) = coalesce_player_actions(events);
 
@@ -582,6 +688,28 @@ fn run_interactive(state: &mut EngineState, display: &mut Display) -> io::Result
                 RawInput::Quit => return Ok(()),
                 RawInput::DismissOverlay => {
                     if state.error_overlay.take().is_some() {
+                        state.dirty = true;
+                    } else if state.inspector_open {
+                        state.inspector_open = false;
+                        state.dirty = true;
+                    }
+                }
+                RawInput::ToggleInspector => {
+                    state.inspector_open = !state.inspector_open;
+                    state.clamp_inspector_selection();
+                    state.dirty = true;
+                }
+                RawInput::InspectorPrev => {
+                    if state.inspector_open && !state.ecs.is_empty() {
+                        let count = state.ecs.len();
+                        state.inspector_selected = (state.inspector_selected + count - 1) % count;
+                        state.dirty = true;
+                    }
+                }
+                RawInput::InspectorNext => {
+                    if state.inspector_open && !state.ecs.is_empty() {
+                        let count = state.ecs.len();
+                        state.inspector_selected = (state.inspector_selected + 1) % count;
                         state.dirty = true;
                     }
                 }
@@ -598,8 +726,8 @@ fn run_interactive(state: &mut EngineState, display: &mut Display) -> io::Result
                         state.set_error(err.to_string());
                     }
                 }
-                RawInput::ResetSameSeed => state.reset_loaded_world(step_now, false),
-                RawInput::ResetNewSeed => state.reset_loaded_world(step_now, true),
+                RawInput::ResetSameSeed => state.reset_loaded_world(display, is_tty, step_now, false),
+                RawInput::ResetNewSeed => state.reset_loaded_world(display, is_tty, step_now, true),
                 RawInput::Action(_) => {}
             }
         }
@@ -619,7 +747,7 @@ fn run_interactive(state: &mut EngineState, display: &mut Display) -> io::Result
             }
         }
 
-        if let Err(err) = state.render_if_dirty(display, Instant::now()) {
+        if let Err(err) = state.render_if_dirty(display, is_tty, Instant::now()) {
             if err.kind() == ErrorKind::BrokenPipe {
                 return Ok(());
             }
@@ -636,20 +764,27 @@ fn run_interactive(state: &mut EngineState, display: &mut Display) -> io::Result
 /// non-interactive smoke run fails to load or step its script.
 fn main() -> LuaResult<()> {
     let options = parse_cli_args().map_err(LuaError::external)?;
-    let _guard = TerminalGuard::enter().map_err(LuaError::external)?;
+    let guard = TerminalGuard::enter().map_err(LuaError::external)?;
+    let is_tty = guard.is_interactive_tty();
 
-    let mut display = Display::new(FRAME_WIDTH, FRAME_HEIGHT);
-    if let Err(err) = display.reserve_space() {
+    let term_size = if is_tty { tty::terminal_size() } else { None };
+    let initial_layout = FrameLayout::compute(term_size, CellWidth::Two, false)
+        .unwrap_or_else(|_| FrameLayout::default_for(CellWidth::Two));
+    let mut display = Display::new(initial_layout.frame_width, initial_layout.frame_height);
+
+    if !is_tty
+        && let Err(err) = display.reserve_space()
+    {
         if err.kind() == ErrorKind::BrokenPipe {
             return Ok(());
         }
         return Err(LuaError::external(err));
     }
 
-    let mut state = EngineState::new(options.script_path);
+    let mut state = EngineState::new(options.script_path, initial_layout);
     let result = match options.max_steps {
         Some(steps) => run_smoke_steps(&mut state, &mut display, steps),
-        None => run_interactive(&mut state, &mut display).map_err(|err| {
+        None => run_interactive(&mut state, &mut display, is_tty).map_err(|err| {
             if err.kind() == ErrorKind::BrokenPipe {
                 return LuaError::external("broken pipe");
             }
@@ -657,8 +792,10 @@ fn main() -> LuaResult<()> {
         }),
     };
 
-    drop(_guard);
-    println!();
+    drop(guard);
+    if !is_tty {
+        println!();
+    }
     result
 }
 
