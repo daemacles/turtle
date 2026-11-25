@@ -4,7 +4,7 @@
 
 ## Project snapshot
 - Name: **turtle** — learning project for embedding Lua in Rust.
-- Location: workspace dir `lmstudio/`; git repo rooted at `turtle/`, branch `main`, remote `origin` (`git@github.com:daemacles/turtle.git`).
+- Location: workspace dir `lmstudio/`; git repo rooted at `turtle/`, branch `main`, tracking `origin/main` (`git@github.com:daemacles/turtle.git`).
 - Stack: Rust 1.95, `mlua` v0.12.2 pinned with features `["lua54", "vendored"]`, `terminal_graphics` v1.1.0, `libc` v0.2 (POSIX raw `termios` / `poll` / `TIOCGWINSZ`, already resolved in `Cargo.lock`).
 - Process rule (user-set): user validates each phase (`cargo run`) before authorizing the next.
 
@@ -14,12 +14,12 @@
 | 0     | Rust app runs inline Lua code that prints `hello, world`                                                                                       | ✅ built & smoke-tested locally — validated by user (2026-11-14)          |
 | 1     | Load and execute a hardcoded `main.lua` file next to the project. Assumed location: CWD-relative `turtle/main.lua`, invoked from inside `turtle/` | ✅ built & smoke-tested locally — validated by user (2026-11-14)          |
 | 2     | Interactive Lua REPL with `terminal_graphics` rendering                                                                                        | ✅ built & smoke-tested locally — validated by user (2026-11-18)         |
-| 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`, raw-mode input, hot-reload)    | ✅ built & smoke-tested locally — validated by user (2026-11-23)          |
+| 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`, raw-mode input, hot-reload)    | ✅ built & smoke-tested locally — validated by user (2026-11-22)          |
 | 3 V2  | Hand-rolled sparse-set ECS (`src/ecs.rs`), scoped `mlua::UserData` Host API, live resize & alt-screen UX, live ECS inspector, `docs/ECS_INTRO.md` | ✅ built & smoke-tested locally — validated by user (2026-11-25)          |
 
 ## Current state (most recent)
-- Phase 3 V2 validated by user on 2026-11-25, committed on `main`, and tagged as `P3V2` (pushed to `origin`); scoping Phase 3 V3 (richer *Tidekeep* gameplay components).
-- Phase 3 V1 validated and tagged as `P3V1` on `e76905c` (pushed to `origin`).
+- Phase 3 V2 validated by user on 2026-11-25, committed on `main` (`f830d10`), tagged as `P3V2` (pushed to `origin`), and merged with `origin/main` (`e26b9c4`); scoping Phase 3 V3 (richer *Tidekeep* gameplay components).
+- Phase 3 V1 validated and tagged as `P3V1` on `e76905c` (pushed to `origin`); evaluation specs and retrospective (`TURTLE_SPEC.md`, `TURTLE_P3V1_ABI.md`, `RETROSPECTIVE_P3V1.md`) preserved at the repository root.
 - Phase 3 V2 implemented across `src/ecs.rs`, `src/model.rs`, `src/lua_host.rs`, `src/tty.rs`, `src/render.rs`, `src/main.rs`, `world.lua` (*Tidekeep*), `examples/simple_room.lua`, `examples/life.lua`, and `docs/ECS_INTRO.md`.
 - Rust owns a pure-Rust hand-rolled generational `SparseSet<T>` ECS (`EcsWorld` in `src/ecs.rs`) with core typed components (`Position`, `Sprite` z-layer, `Name`, `Player`, `Solid`) plus dynamic `ScriptValue` stores, exposed to migrated V2 Lua scripts via scoped `mlua::UserData` (`world.init(seed, ecs)`, `world.step(t, requests, ecs)`) with transactional step rollback on Lua errors.
 - Terminal UX upgraded with alternate screen buffer (`\x1b[?1049h`/`l`), async-signal-safe `SIGWINCH` live resize (`FrameLayout` odd viewport sizing), synchronized output (`\x1b[?2026h`/`l`), and an adaptive live ECS Inspector (`Tab`/`i` to toggle, `[`/`]` to select entities; docks as a side drawer at `>= 106` columns or opens as a modal overlay on narrower panes).
@@ -62,10 +62,11 @@ cd turtle && cargo test && cargo run -- --steps 4
 16. **`terminal_graphics::Container` does not clear cell characters**: `Container::draw` only sets `pixel.set_background(...)` and leaves underlying glyphs and foreground colors intact. Always paint an opaque `Rect::new(..., Colour::Black)` before drawing any modal `Container` over map terrain or entities (centralized in `render::draw_opaque_modal`).
 
 ## Next steps
-- [x] Wait for user to validate Phase 3 V1 (`cargo run`, `cargo run -- examples/life.lua`, `cargo run -- examples/simple_room.lua`, and live `world.lua` editing) — validated 2026-11-23.
+- [x] Wait for user to validate Phase 3 V1 (`cargo run`, `cargo run -- examples/life.lua`, `cargo run -- examples/simple_room.lua`, and live `world.lua` editing) — validated 2026-11-22.
+- [ ] User runs external model evaluation against `TURTLE_SPEC.md` and `TURTLE_P3V1_ABI.md` (optional side quest).
 - [x] Tag `P3V1` on `e76905c` and push to `origin`; scope Phase 3 V2 with user (`1A, 2A, migrate Lua, terminal UX + ECS inspector, docs/ECS_INTRO.md`).
 - [x] Wait for user to validate Phase 3 V2 (`cargo run`, resize terminal to test live resize + docked ECS drawer at `>= 106` cols, `Tab`/`i` + `[`/`]` inspector, `examples/simple_room.lua`, `examples/life.lua`, and live `world.lua` editing) — validated 2026-11-25.
-- [x] Confirm commit/push and `P3V2` tag for Phase 3 V2, then scope the next phase before implementing.
+- [x] Confirm commit/push and `P3V2` tag for Phase 3 V2, merge `origin/main` (`e26b9c4`), then scope the next phase before implementing.
 - [ ] Approve and implement Phase 3 V3 (richer *Tidekeep* gameplay components & ECS systems).
 - [ ] **Future work (post-phase V2 roadmap):**
   - Port hand-rolled sparse-set ECS (`src/ecs.rs`) to an archetype ECS crate (`hecs` or `bevy_ecs`) behind the Lua `UserData` ABI boundary.
@@ -97,14 +98,21 @@ cd turtle && cargo test && cargo run -- --steps 4
 - Verified `cargo test` (13 passed), `cargo clippy --all-targets -- -D warnings -D missing_docs`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, LuaLS (`4/4` clean), `comment_load.py --fail-over 0` (`0` warnings across all 8 files), `--steps 4` runs, and PTY interactive + live Shadow-VM hot-reload tests.
 - Updated `README.md` and `LEDGER.md`.
 
-### 2026-11-23 — session 5 (Phase 3 V1 tagged; Phase 3 V2 implemented)
+### 2026-11-22 — session 5 (Phase 3 V1 validation + evaluation specs)
+- User validated Phase 3 V1 and requested clean-room + ABI conformance specs for evaluating another model prior to Phase 3 V2, plus a session retrospective.
+- Created `TURTLE_SPEC.md` (clean-room functional requirements for the engine + all 3 world archetypes, V2 ECS modularity seam, automated checks, and human validation rubric; no crate/version prescriptions).
+- Created `TURTLE_P3V1_ABI.md` (exact Phase 3 V1 host–script ABI specification matching unmodified `world.lua`, `examples/life.lua`, and `examples/simple_room.lua` for Stage 2 conformance testing).
+- Created `RETROSPECTIVE_P3V1.md` (narrative summary, terms-of-art glossary, and simulated worked prompting example).
+- Updated `README.md` and `LEDGER.md` with Phase 3 V1 validation status, `origin/main` tracking note, and links to the new docs.
+
+### 2026-11-23 — session 6 (Phase 3 V1 tagged; Phase 3 V2 implemented)
 - User validated Phase 3 V1 and authorized starting Phase 3 V2.
 - Recorded intervening commits since session 4 (`512d211` dexiotites update, `e76905c` `jim: updated docs in world.lua`) and configured `origin` remote (`git@github.com:daemacles/turtle.git`).
 - Created annotated tag `P3V1` on `e76905c` and pushed to `origin`.
 - Scoped Phase 3 V2 with user: hand-rolled generational sparse-set ECS (`src/ecs.rs`), hybrid Rust/Lua split via scoped `mlua::UserData` with transactional step rollback (`src/lua_host.rs`), full migration of `world.lua`, `examples/simple_room.lua`, and `examples/life.lua` to V2, terminal UX upgrades (alt-screen, `SIGWINCH` live resize, synchronized framing in `src/tty.rs` + `FrameLayout` in `src/model.rs`), live adaptive ECS inspector (`src/render.rs`), and `docs/ECS_INTRO.md` (linked from `README.md`).
 - Updated `README.md` and `LEDGER.md` with V2 docs and Future Work (`hecs`/`bevy_ecs` port; richer Tidekeep gameplay components).
 
-### 2026-11-24 / 2026-11-25 — session 6 (Modal overlay fix & Phase 3 V2 validated)
+### 2026-11-24 / 2026-11-25 — session 7 (Modal overlay fix, Phase 3 V2 validated & pushed)
 - Fixed modal overlay glyph bleed-through in `src/render.rs` (`draw_opaque_modal` painting an opaque `Rect` fill before `Container`) with cell-level regression tests; recorded `Container` gotcha #16.
-- User validated Phase 3 V2 (`2026-11-25`); updated `LEDGER.md` and `README.md` phase status (working tree left uncommitted) and opened next-phase scoping.
-- Committed Phase 3 V2 to `main` and pushed `main` + annotated tag `P3V2` to `origin`; selected richer *Tidekeep* gameplay components as Phase 3 V3 and flagged `hecs`/`bevy_ecs` port plus next-stage `mlua` features (coroutines, stateful hot-reload/save-load, multi-file `require`) as post-phase V2 future work.
+- User validated Phase 3 V2 (`2026-11-25`); updated `LEDGER.md` and `README.md` phase status and opened next-phase scoping.
+- Committed Phase 3 V2 (`f830d10`), created and pushed annotated tag `P3V2` to `origin`, merged `origin/main` (`e26b9c4`, preserving `TURTLE_SPEC.md`, `TURTLE_P3V1_ABI.md`, and `RETROSPECTIVE_P3V1.md`), selected richer *Tidekeep* gameplay components as Phase 3 V3, and flagged `hecs`/`bevy_ecs` port plus next-stage `mlua` features (coroutines, stateful hot-reload/save-load, multi-file `require`) as post-phase V2 future work.

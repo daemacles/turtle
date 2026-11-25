@@ -9,7 +9,7 @@ A learning project about embedding **Lua** in **Rust** with [mlua](https://crate
 | 0     | Rust app runs inline Lua code that prints `hello, world`                                                | ✅ done (2026-11-14) — validated by user                                 |
 | 1     | Load and execute a hardcoded `main.lua` file next to the project                                        | ✅ done (2026-11-14) — validated by user                                 |
 | 2     | Interactive Lua REPL with `terminal_graphics` rendering                                                 | ✅ done (2026-11-18) — validated by user                                 |
-| 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`) | ✅ done (2026-11-23) — validated by user                                 |
+| 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`) | ✅ done (2026-11-22) — validated by user                                 |
 | 3 V2  | Hand-rolled sparse-set ECS, scoped `mlua::UserData` Host API, live resize & ECS inspector               | ✅ done (2026-11-25) — validated by user                                 |
 
 ## Phase 3 V2: Hand-Rolled ECS, Host API & Terminal UX
@@ -105,4 +105,7 @@ Richer *Tidekeep* gameplay components are moving into **Phase 3 V3**. After the 
 ## Tracking state
 
 - [LEDGER.md](LEDGER.md) — agent state ledger: current phase, decisions/gotchas, next steps. Read this first when resuming after a context reset.
+- [TURTLE_SPEC.md](TURTLE_SPEC.md) — clean-room Phase 3 V1 functional specification and evaluation rubric for external model comparison.
+- [TURTLE_P3V1_ABI.md](TURTLE_P3V1_ABI.md) — exact Phase 3 V1 host–script ABI conformance specification for drop-in script compatibility.
+- [RETROSPECTIVE_P3V1.md](RETROSPECTIVE_P3V1.md) — Phase 3 V1 session retrospective, terms of art glossary, and prompting worked example.
 - Git history — one commit per significant change; `git log --oneline` for the trail.
