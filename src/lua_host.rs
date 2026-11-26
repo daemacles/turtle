@@ -989,4 +989,109 @@ mod tests {
         let (next_ecs, _, _) = active.step(1, &[], &ecs).unwrap();
         assert_eq!(next_ecs.len(), ecs.len());
     }
+
+    #[test]
+    fn tidekeep_v3_ecs_systems_cover_bridges_combat_pickups_status_and_ai() {
+        let world = LuaWorld::load_from_path(Path::new("world.lua")).unwrap();
+        let (base_ecs, _, _) = world.init(42).unwrap();
+        let (player_id, _) = base_ecs.player().unwrap();
+        assert!(base_ecs.has_component(player_id, "hp"));
+        assert!(base_ecs.has_component(player_id, "combat"));
+        assert!(base_ecs.has_component(player_id, "inventory"));
+        assert!(!base_ecs.query(&["pickup"]).is_empty());
+        assert!(base_ecs.query(&["ai"]).len() >= 3);
+
+        // 1. Walk east twice to push crate1 into (3,0) water, creating a bridge entity.
+        let mut ecs = base_ecs.clone();
+        for tick in 1..=2 {
+            let (_, pos) = ecs.player().unwrap();
+            let intent = Intent {
+                target: IntentTarget::Entity(player_id),
+                action: Action::Move { dx: 1, dy: 0 },
+                origin: pos,
+            };
+            let (next_ecs, _, _) = world.step(tick, &[intent], &ecs).unwrap();
+            ecs = next_ecs;
+        }
+        assert!(ecs.find_by_name("crate1").is_none());
+        let bridges = ecs.query(&["bridge"]);
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(ecs.position(bridges[0]), Some(Coord::new(3, 0)));
+        assert_eq!(ecs.position(player_id), Some(Coord::new(2, 0)));
+
+        // Stepping east again stands the player on top of the bridge entity.
+        let step_on_bridge = Intent {
+            target: IntentTarget::Entity(player_id),
+            action: Action::Move { dx: 1, dy: 0 },
+            origin: Coord::new(2, 0),
+        };
+        let (ecs, _, _) = world.step(3, &[step_on_bridge], &ecs).unwrap();
+        assert_eq!(ecs.position(player_id), Some(Coord::new(3, 0)));
+        assert_eq!(ecs.at(Coord::new(3, 0)).len(), 2);
+
+        // 2. Collect tonic1 at (1,-1) and verify inventory + despawn.
+        let mut ecs = base_ecs.clone();
+        for (tick, (dx, dy)) in [(1, (1, 0)), (2, (0, -1))] {
+            let (_, pos) = ecs.player().unwrap();
+            let intent = Intent {
+                target: IntentTarget::Entity(player_id),
+                action: Action::Move { dx, dy },
+                origin: pos,
+            };
+            let (next_ecs, _, _) = world.step(tick, &[intent], &ecs).unwrap();
+            ecs = next_ecs;
+        }
+        assert!(ecs.find_by_name("tonic1").is_none());
+        let ScriptValue::Table(inv) = ecs.custom(player_id, "inventory").unwrap() else {
+            panic!("expected inventory table");
+        };
+        assert_eq!(inv.get("tonics"), Some(&ScriptValue::Int(2)));
+
+        // 3. Salt Flare attaches stun status, ticks it down over 3 steps, then prunes it.
+        let mut ecs = base_ecs;
+        let crab1 = ecs.find_by_name("crab1").unwrap();
+        ecs.set_position(crab1, Coord::new(0, -1));
+        let flare_intent = Intent {
+            target: IntentTarget::Entity(player_id),
+            action: Action::Act,
+            origin: Coord::new(0, 0),
+        };
+        let (mut ecs, _, _) = world.step(1, &[flare_intent], &ecs).unwrap();
+        assert!(ecs.has_component(crab1, "status"));
+        assert_eq!(ecs.sprite(crab1).unwrap().tile, "Z");
+        assert_eq!(ecs.position(crab1), Some(Coord::new(0, -1)));
+
+        for tick in 2..=4 {
+            let (next_ecs, _, _) = world.step(tick, &[], &ecs).unwrap();
+            ecs = next_ecs;
+        }
+        assert!(!ecs.has_component(crab1, "status"));
+        assert_eq!(ecs.sprite(crab1).unwrap().tile, "C");
+
+        // 4. Melee bumps drop crab1 to 1 HP ("flee") and then despawn it at 0 HP.
+        ecs.set_position(crab1, Coord::new(0, -1));
+        let bump1 = Intent {
+            target: IntentTarget::Entity(player_id),
+            action: Action::Move { dx: 0, dy: -1 },
+            origin: Coord::new(0, 0),
+        };
+        let (mut ecs, _, _) = world.step(5, &[bump1], &ecs).unwrap();
+        let ScriptValue::Table(hp) = ecs.custom(crab1, "hp").unwrap() else {
+            panic!("expected hp table");
+        };
+        assert_eq!(hp.get("cur"), Some(&ScriptValue::Int(1)));
+        let ScriptValue::Table(ai) = ecs.custom(crab1, "ai").unwrap() else {
+            panic!("expected ai table");
+        };
+        assert_eq!(ai.get("state"), Some(&ScriptValue::Str("flee".to_string())));
+
+        ecs.set_position(crab1, Coord::new(0, -1));
+        let bump2 = Intent {
+            target: IntentTarget::Entity(player_id),
+            action: Action::Move { dx: 0, dy: -1 },
+            origin: Coord::new(0, 0),
+        };
+        let (ecs, _, _) = world.step(6, &[bump2], &ecs).unwrap();
+        assert!(!ecs.is_alive(crab1));
+    }
 }

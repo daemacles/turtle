@@ -138,11 +138,11 @@ pub fn compose_frame(display: &mut Display, state: &FrameState<'_>) {
     draw_outer_chrome(display, state.layout, border_colour);
     draw_header_row(display, state, border_colour);
 
-    let terrain_bgs = draw_terrain(display, state);
+    let mut cell_bgs = draw_terrain(display, state);
     if state.ecs.player().is_none() {
-        draw_center_cursor(display, state, &terrain_bgs);
+        draw_center_cursor(display, state, &cell_bgs);
     }
-    draw_entities(display, state, &terrain_bgs);
+    draw_entities(display, state, &mut cell_bgs);
 
     draw_divider_status(display, state, border_colour);
     draw_event_log(display, state.layout, state.log);
@@ -359,20 +359,20 @@ fn draw_center_cursor(display: &mut Display, state: &FrameState<'_>, terrain_bgs
 }
 
 /// Composites visible entities over terrain in z-layer and creation order.
-fn draw_entities(display: &mut Display, state: &FrameState<'_>, terrain_bgs: &[Vec<Colour>]) {
+fn draw_entities(display: &mut Display, state: &FrameState<'_>, cell_bgs: &mut [Vec<Colour>]) {
     let fallback = TileStyle::from_spec("?", Colour::BrightMagenta, None);
     for (_id, pos, sprite, _is_player) in state.ecs.renderables() {
-        draw_one_entity(display, state, pos, &sprite.tile, terrain_bgs, &fallback);
+        draw_one_entity(display, state, pos, &sprite.tile, cell_bgs, &fallback);
     }
 }
 
-/// Draws a single visible entity using terrain background inheritance and contrast checking.
+/// Draws a single visible entity using underlying background inheritance and contrast checking.
 fn draw_one_entity(
     display: &mut Display,
     state: &FrameState<'_>,
     pos: Coord,
     tile_key: &str,
-    terrain_bgs: &[Vec<Colour>],
+    cell_bgs: &mut [Vec<Colour>],
     fallback: &TileStyle,
 ) {
     if !state.bounds.contains(pos) {
@@ -381,12 +381,15 @@ fn draw_one_entity(
     let rx = (pos.x - state.bounds.min.x) as usize;
     let ry = (pos.y - state.bounds.min.y) as usize;
     let style = state.palette.get(tile_key).unwrap_or(fallback);
-    let under_bg = terrain_bgs
+    let under_bg = cell_bgs
         .get(ry)
         .and_then(|r| r.get(rx))
         .copied()
         .unwrap_or(Colour::Black);
     let bg = style.bg.unwrap_or(under_bg);
+    if let Some(slot) = cell_bgs.get_mut(ry).and_then(|r| r.get_mut(rx)) {
+        *slot = bg;
+    }
     let fg = contrast_safe_fg(style.fg, bg);
     let screen_y = 1 + ry as isize;
 
@@ -1042,5 +1045,80 @@ mod tests {
                 assert_ne!(p.character(), '≈');
             }
         }
+    }
+
+    #[test]
+    fn stacked_opaque_entity_propagates_background_to_transparent_actor() {
+        let mut palette = HashMap::new();
+        palette.insert(
+            "=".to_string(),
+            TileStyle::from_spec("==", Colour::BrightYellow, Some(Colour::Green)),
+        );
+        palette.insert(
+            "@".to_string(),
+            TileStyle::from_spec("@ ", Colour::BrightYellow, None),
+        );
+
+        let mut ecs = EcsWorld::new();
+        let bridge = ecs.spawn();
+        ecs.set_position(bridge, Coord::new(0, 0));
+        ecs.set_sprite(
+            bridge,
+            Sprite {
+                tile: "=".into(),
+                layer: 1,
+            },
+        );
+
+        let player = ecs.spawn();
+        ecs.set_position(player, Coord::new(0, 0));
+        ecs.set_sprite(
+            player,
+            Sprite {
+                tile: "@".into(),
+                layer: 10,
+            },
+        );
+        ecs.set_player(player, true);
+
+        let layout = FrameLayout::default_for(CellWidth::Two);
+        let cam = Camera::default();
+        let bounds = cam.bounds(layout.viewport_cols, layout.viewport_rows);
+        let terrain = empty_terrain(layout.viewport_cols, layout.viewport_rows, Some(Colour::Blue));
+        let log = MessageLog::default();
+
+        let state = FrameState {
+            title: "Tidekeep",
+            pacing: Pacing::Hybrid { idle_ms: 650 },
+            cell_width: CellWidth::Two,
+            layout,
+            tick: 1,
+            seed: 42,
+            paused: false,
+            reload_flash: false,
+            bounds,
+            terrain: &terrain,
+            ecs: &ecs,
+            palette: &palette,
+            camera_center: cam.center,
+            hud_status: "",
+            log: &log,
+            inspector_open: false,
+            inspector_selected: 0,
+            error_overlay: None,
+            terminal_too_small: None,
+        };
+
+        let mut display = Display::new(layout.frame_width, layout.frame_height);
+        compose_frame(&mut display, &state);
+
+        // Player at world (0,0) inherits Green from the layer-1 bridge instead of Blue terrain.
+        let left = display.pixel(38, 9).unwrap();
+        let right = display.pixel(39, 9).unwrap();
+        assert_eq!(left.character(), '@');
+        assert_eq!(right.character(), ' ');
+        assert_eq!(left.background(), Colour::Green);
+        assert_eq!(right.background(), Colour::Green);
+        assert_eq!(left.colour(), Colour::BrightYellow);
     }
 }

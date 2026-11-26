@@ -16,16 +16,16 @@
 | 2     | Interactive Lua REPL with `terminal_graphics` rendering                                                                                        | ✅ built & smoke-tested locally — validated by user (2026-11-18)         |
 | 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`, raw-mode input, hot-reload)    | ✅ built & smoke-tested locally — validated by user (2026-11-22)          |
 | 3 V2  | Hand-rolled sparse-set ECS (`src/ecs.rs`), scoped `mlua::UserData` Host API, live resize & alt-screen UX, live ECS inspector, `docs/ECS_INTRO.md` | ✅ built & smoke-tested locally — validated by user (2026-11-25)          |
+| 3 V3  | Richer *Tidekeep* gameplay & ECS systems (`world.lua`: `hp`, `combat`, `pickup`/`inventory`, `status` expiry, `ai` FSM, `bridge` entities; entity bg inheritance in `src/render.rs`) | ✅ built & smoke-tested locally — validated by user (2026-11-25)          |
 
 ## Current state (most recent)
-- Phase 3 V2 validated by user on 2026-11-25, committed on `main` (`f830d10`), tagged as `P3V2` (pushed to `origin`), and merged with `origin/main` (`e26b9c4`); scoping Phase 3 V3 (richer *Tidekeep* gameplay components).
+- Phase 3 V3 validated by user (`2026-11-25`), committed, and pushed to `origin/main` (implemented across `world.lua`, `src/render.rs` opaque entity background propagation, and `src/lua_host.rs` V3 integration tests).
+- Phase 3 V2 validated by user on 2026-11-25, committed on `main` (`f830d10`), tagged as `P3V2` (pushed to `origin`), and merged with `origin/main` (`e26b9c4`).
 - Phase 3 V1 validated and tagged as `P3V1` on `e76905c` (pushed to `origin`); evaluation specs and retrospective (`TURTLE_SPEC.md`, `TURTLE_P3V1_ABI.md`, `RETROSPECTIVE_P3V1.md`) preserved at the repository root.
-- Phase 3 V2 implemented across `src/ecs.rs`, `src/model.rs`, `src/lua_host.rs`, `src/tty.rs`, `src/render.rs`, `src/main.rs`, `world.lua` (*Tidekeep*), `examples/simple_room.lua`, `examples/life.lua`, and `docs/ECS_INTRO.md`.
-- Rust owns a pure-Rust hand-rolled generational `SparseSet<T>` ECS (`EcsWorld` in `src/ecs.rs`) with core typed components (`Position`, `Sprite` z-layer, `Name`, `Player`, `Solid`) plus dynamic `ScriptValue` stores, exposed to migrated V2 Lua scripts via scoped `mlua::UserData` (`world.init(seed, ecs)`, `world.step(t, requests, ecs)`) with transactional step rollback on Lua errors.
-- Terminal UX upgraded with alternate screen buffer (`\x1b[?1049h`/`l`), async-signal-safe `SIGWINCH` live resize (`FrameLayout` odd viewport sizing), synchronized output (`\x1b[?2026h`/`l`), and an adaptive live ECS Inspector (`Tab`/`i` to toggle, `[`/`]` to select entities; docks as a side drawer at `>= 106` columns or opens as a modal overlay on narrower panes).
-- Educational guide written at `docs/ECS_INTRO.md` and linked from `README.md`.
+- Rust owns a pure-Rust hand-rolled generational `SparseSet<T>` ECS (`EcsWorld` in `src/ecs.rs`) with core typed components (`Position`, `Sprite` z-layer, `Name`, `Player`, `Solid`) plus dynamic `ScriptValue` stores, exposed to migrated Lua scripts via scoped `mlua::UserData` (`world.init(seed, ecs)`, `world.step(t, requests, ecs)`) with transactional step rollback on Lua errors.
+- *Tidekeep* (`world.lua`) runs an ordered ECS pipeline (`status_tick_system` -> `player_intent_system` -> `ai_system` -> `hud_system`) exercising melee combat (`hp`/`combat`), collectible pickups (`tonic`, `spear`), Salt Flares (`e`), crate slams, timed `status` expiry/pruning, crab AI states (`patrol`/`chase`/`flee`/`stunned`), and stacked `bridge` entities (`layer = 1`).
 - `main.lua` remains preserved at the repository root.
-- All verification gates pass: `cargo test` (19 passed), `cargo clippy --all-targets -- -D warnings -D missing_docs`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, LuaLS (`4/4` clean), `comment_load.py --fail-over 0` (`0` warnings across all 9 code files), `--steps 4` runs (`world.lua`, `examples/life.lua`, `examples/simple_room.lua`), and PTY interactive tests (alt-screen, modal + docked inspector, live `SIGWINCH` resize, movement, and hot-reload recovery).
+- All verification gates pass: `cargo test` (21 passed), `cargo clippy --all-targets -- -D warnings -D missing_docs`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, LuaLS (`4/4` clean), `comment_load.py --fail-over 0` (`0` warnings across all 9 code files), `--steps 4` runs (`world.lua`, `examples/life.lua`, `examples/simple_room.lua`), and PTY interactive tests.
 
 ## How to run right now
 ```bash
@@ -67,7 +67,8 @@ cd turtle && cargo test && cargo run -- --steps 4
 - [x] Tag `P3V1` on `e76905c` and push to `origin`; scope Phase 3 V2 with user (`1A, 2A, migrate Lua, terminal UX + ECS inspector, docs/ECS_INTRO.md`).
 - [x] Wait for user to validate Phase 3 V2 (`cargo run`, resize terminal to test live resize + docked ECS drawer at `>= 106` cols, `Tab`/`i` + `[`/`]` inspector, `examples/simple_room.lua`, `examples/life.lua`, and live `world.lua` editing) — validated 2026-11-25.
 - [x] Confirm commit/push and `P3V2` tag for Phase 3 V2, merge `origin/main` (`e26b9c4`), then scope the next phase before implementing.
-- [ ] Approve and implement Phase 3 V3 (richer *Tidekeep* gameplay components & ECS systems).
+- [x] Approve and implement Phase 3 V3 (richer *Tidekeep* gameplay components & ECS systems).
+- [x] Wait for user to validate Phase 3 V3 (`cargo run` — test combat, tonics/spear/flares, status expiry & AI state flips in `Tab` inspector, crate slams, and `bridge` layering) — validated 2026-11-25.
 - [ ] **Future work (post-phase V2 roadmap):**
   - Port hand-rolled sparse-set ECS (`src/ecs.rs`) to an archetype ECS crate (`hecs` or `bevy_ecs`) behind the Lua `UserData` ABI boundary.
   - Explore next-stage `mlua` engine features: Lua coroutines (`coroutine.yield()`), stateful hot-reload & save/load serialization (`serde` snapshots of `EcsWorld`), and multi-file sandboxed `require`.
@@ -116,3 +117,10 @@ cd turtle && cargo test && cargo run -- --steps 4
 - Fixed modal overlay glyph bleed-through in `src/render.rs` (`draw_opaque_modal` painting an opaque `Rect` fill before `Container`) with cell-level regression tests; recorded `Container` gotcha #16.
 - User validated Phase 3 V2 (`2026-11-25`); updated `LEDGER.md` and `README.md` phase status and opened next-phase scoping.
 - Committed Phase 3 V2 (`f830d10`), created and pushed annotated tag `P3V2` to `origin`, merged `origin/main` (`e26b9c4`, preserving `TURTLE_SPEC.md`, `TURTLE_P3V1_ABI.md`, and `RETROSPECTIVE_P3V1.md`), selected richer *Tidekeep* gameplay components as Phase 3 V3, and flagged `hecs`/`bevy_ecs` port plus next-stage `mlua` features (coroutines, stateful hot-reload/save-load, multi-file `require`) as post-phase V2 future work.
+
+### 2026-11-25 — session 8 (Phase 3 V3 implemented)
+- Propagated opaque lower-layer entity backgrounds across `draw_entities` / `draw_one_entity` in `src/render.rs` so higher transparent sprites inherit `bridge` backgrounds cleanly, with regression test.
+- Upgraded `world.lua` (*Tidekeep* V3) with composable `hp`, `combat`, `pickup`/`inventory`, timed `status` (`stun`, `invuln`, `regen`) with sparse-set pruning, component-driven `ai` FSM (`patrol`, `chase`, `flee`, `stunned`), Shell Crab enemy (`K`), crate slams, and real stacked `bridge` entities (`layer = 1`), organized into `status_tick_system` -> `player_intent_system` -> `ai_system` -> `hud_system`.
+- Added V3 integration test in `src/lua_host.rs` and verified `cargo test` (21 passed), `cargo clippy`, `cargo doc`, LuaLS (`4/4`), `comment_load.py --fail-over 0`, `--steps 4` runs, and PTY interactive smoke tests.
+- Updated `README.md` and `LEDGER.md`.
+- User validated Phase 3 V3 (`2026-11-25`); synced `README.md` and `LEDGER.md`, committed on `main`, and pushed to `origin/main`.

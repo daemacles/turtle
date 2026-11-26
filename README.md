@@ -11,12 +11,13 @@ A learning project about embedding **Lua** in **Rust** with [mlua](https://crate
 | 2     | Interactive Lua REPL with `terminal_graphics` rendering                                                 | ✅ done (2026-11-18) — validated by user                                 |
 | 3 V1  | Lua-driven 2D tile grid world engine (`world.lua` *Tidekeep*, `examples/life.lua`, `examples/simple_room.lua`) | ✅ done (2026-11-22) — validated by user                                 |
 | 3 V2  | Hand-rolled sparse-set ECS, scoped `mlua::UserData` Host API, live resize & ECS inspector               | ✅ done (2026-11-25) — validated by user                                 |
+| 3 V3  | Richer *Tidekeep* gameplay & ECS systems (HP/combat, pickups/inventory, status timers, AI FSM, bridges) | ✅ done (2026-11-25) — validated by user                                 |
 
-## Phase 3 V2: Hand-Rolled ECS, Host API & Terminal UX
+## Phase 3 V2/V3: Hand-Rolled ECS, Host API & *Tidekeep* Systems
 
 > **New to ECS?** Read [docs/ECS_INTRO.md](docs/ECS_INTRO.md) for an introduction to the Entity Component System pattern, the problems it solves and friction it introduces, turtle's sparse-set design, and how it maps onto `hecs` and `bevy_ecs`.
 
-**Goal:** Rust runs an adaptive terminal engine (alternate screen buffer, instant `SIGWINCH` live resize, synchronized output framing, atomic Shadow-VM hot-reload, and a hand-rolled generational sparse-set ECS exposed via scoped `mlua::UserData`), while migrated V2 Lua scripts (`world.lua` by default, or `argv[1]`) define the map, palette, and gameplay rules.
+**Goal:** Rust runs an adaptive terminal engine (alternate screen buffer, instant `SIGWINCH` live resize, synchronized output framing, atomic Shadow-VM hot-reload, and a hand-rolled generational sparse-set ECS exposed via scoped `mlua::UserData`), while migrated V2/V3 Lua scripts (`world.lua` by default, or `argv[1]`) define the map, palette, and gameplay rules.
 
 ### Running
 
@@ -24,7 +25,7 @@ A learning project about embedding **Lua** in **Rust** with [mlua](https://crate
 cd turtle && cargo run
 ```
 
-Runs `world.lua` (**Tidekeep** — procedural archipelago with pushable driftwood bridges, Sun Gems, and Reef Crabs in *Ultima*-style hybrid pacing). Open `world.lua` in an editor next to your terminal, tweak `SEA_LEVEL` or `CRAB_PERIOD` at the top, and save to see the world hot-reload at `t = 0`. Resize your terminal window while playing to expand the viewport or reveal the docked ECS Inspector drawer (`>= 106` columns).
+Runs `world.lua` (**Tidekeep** — procedural archipelago with pushable driftwood `bridge` entities, bump-to-attack melee combat and crate slams, **Healing Tonics** (`++`) and a **Coral Spear** (`/^`), timed `status` timers like `stun`/`invuln`/`regen`, Sun Gems, and Reef/Shell Crabs driven by an `ai` finite-state machine in *Ultima*-style hybrid pacing). Open `world.lua` in an editor next to your terminal, tweak `SEA_LEVEL` or `CRAB_PERIOD` at the top, and save to see the world hot-reload at `t = 0`. Resize your terminal window while playing to expand the viewport or reveal the docked ECS Inspector drawer (`>= 106` columns).
 
 Try the included examples too:
 
@@ -46,7 +47,7 @@ cd turtle && cargo test
 | --- | --- | --- |
 | `WASD` / `HJKL` / `Arrows` | Move player or pan camera | In playerless worlds like `examples/life.lua`, pans the viewport directly |
 | `Space` / `.` | Wait in place | Passes a turn (`dx = 0, dy = 0`) |
-| `e` / `Enter` | Context action (`act`) | Toggles the center cell in `examples/life.lua` |
+| `e` / `Enter` | Context action (`act`) | Drinks a Healing Tonic when hurt or fires a Salt Flare near crabs in *Tidekeep*; toggles center cell in `examples/life.lua` |
 | `Tab` / `i` | Toggle ECS Inspector | Docks as a side drawer (`>= 106` cols) or opens a modal overlay on narrower panes |
 | `[` / `]` | Select prev / next entity | Cycles live entities in the ECS Inspector while gameplay continues |
 | `p` | Pause / Play | Freezes `tick` and `hybrid` timers |
@@ -87,7 +88,7 @@ A world script returns a table (or defines global `world`) with:
 - `src/model.rs` — `Coord`, `RectBounds`, `Pacing`, `CellWidth`, `FrameLayout` (adaptive odd viewport sizing + drawer threshold), `TileStyle`, `Action`, `Intent`, `RepeatCadence`, and `Camera` (deadzone + pan).
 - `src/tty.rs` — zero-extra-crate raw POSIX `termios` + `poll` guard (`libc`), alternate screen buffer, async-signal-safe `SIGWINCH` handler, synchronized output framing (`?2026h`/`l`), panic restore hook, and escape sequence decoder.
 - `src/lua_host.rs` — `LuaWorld` marshaling, scoped `mlua::UserData` `EcsWorld` bindings with transactional step rollback, captured `print`, `FileStampWatcher`, and atomic Shadow-VM hot-reload.
-- `src/render.rs` — adaptive `terminal_graphics` compositor with `Colour::Black` fills, z-ordered transparent entity compositing, contrast guard, event log, adaptive ECS Inspector (side drawer or modal), and error overlay.
+- `src/render.rs` — adaptive `terminal_graphics` compositor with `Colour::Black` fills, z-ordered transparent entity compositing with opaque lower-layer background propagation, contrast guard, event log, adaptive ECS Inspector (side drawer or modal), and error overlay.
 - `src/main.rs` — CLI entry point (`world.lua` default, `argv[1]` override, `--steps N` smoke flag), live resize sync, and unified `poll()` loop.
 
 (`main.lua` from Phase 1 remains untouched on disk.)
@@ -97,7 +98,7 @@ A world script returns a table (or defines global `world`) with:
 
 ## Future Work (post-phase V2)
 
-Richer *Tidekeep* gameplay components are moving into **Phase 3 V3**. After the current phases are complete, future V2 tracks include:
+After the current phases are complete, future V2 tracks include:
 
 - **Port hand-rolled ECS to an archetype crate (`hecs` or `bevy_ecs`):** evaluate replacing `src/ecs.rs` internals with `hecs` or `bevy_ecs` behind the Lua `UserData` boundary (see [docs/ECS_INTRO.md](docs/ECS_INTRO.md)).
 - **Next-stage `mlua` & engine capabilities:** Lua coroutines (`coroutine.yield()` for multi-turn actor behaviors), stateful hot-reload and save/load serialization (`serde` snapshots of `EcsWorld`), and multi-file sandboxed `require`.
